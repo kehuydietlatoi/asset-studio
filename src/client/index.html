@@ -1,0 +1,65 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Asset Studio</title>
+    <link rel="stylesheet" href="./style.css" />
+  </head>
+  <body>
+    <header>
+      <strong id="projectName">Asset Studio</strong>
+      <span id="agentBadge" class="badge"></span>
+      <nav id="views">
+        <button data-view="focus" class="on">Focus</button>
+        <button data-view="lineup">Line-up</button>
+        <button data-view="board">Board</button>
+      </nav>
+      <span id="toast"></span>
+    </header>
+    <main>
+      <aside id="assetList"></aside>
+      <section id="center">
+        <div id="toolbar">
+          <button data-tool="mask" class="on" title="Paint the area that may change (M)">Mask</button>
+          <button data-tool="pin" title="Numbered note at a point (P)">Pin</button>
+          <button data-tool="pen" title="Free drawing, for explanation only (D)">Pen</button>
+          <button data-tool="arrow" title="Arrow, for explanation only (A)">Arrow</button>
+          <label>Size <input id="brush" type="range" min="8" max="120" value="40" /></label>
+          <button id="undo" title="Undo (Ctrl+Z)">Undo</button>
+          <button id="clear">Clear</button>
+          <span class="sep"></span>
+          <label><input id="compare" type="checkbox" /> Compare with candidate</label>
+          <label>Zoom <select id="zoom"><option value="fit">Fit</option><option value="1">100%</option><option value="2">200%</option></select></label>
+        </div>
+        <div id="stageWrap"><canvas id="stage"></canvas></div>
+        <div id="lineupWrap" class="hidden"><canvas id="lineup" width="1600" height="640"></canvas></div>
+        <div id="board" class="hidden"></div>
+      </section>
+      <aside id="panel">
+        <h2 id="assetTitle">Pick an asset</h2>
+        <div id="statusRow">
+          <span id="statusChip" class="chip"></span>
+          <button id="approve">Approve</button>
+          <button id="needsFix">Needs fix</button>
+        </div>
+        <h3>Pins</h3>
+        <ol id="pins"></ol>
+        <h3>Note</h3>
+        <textarea id="notes" rows="3" placeholder="Anything that is not tied to one point"></textarea>
+        <h3>Reference photos <small>(paste or drop)</small></h3>
+        <div id="photos"></div>
+        <button id="send" class="primary">Send to agent</button>
+        <div id="sendState"></div>
+        <div id="reply" class="hidden"></div>
+        <div id="candidate" class="hidden">
+          <strong id="candTitle"></strong>
+          <div class="row"><button id="accept" class="primary">Accept</button><button id="reject">Reject</button></div>
+        </div>
+        <h3>Versions</h3>
+        <ul id="versions"></ul>
+      </aside>
+    </main>
+    <script type="module" src="./main.ts"></script>
+  </body>
+</html>

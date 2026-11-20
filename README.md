@@ -44,6 +44,7 @@ Image edits always go through the Codex CLI's built-in image generation (`codex 
 asset-studio dev                      serve the page
 asset-studio watch                    print NEW FEEDBACK: <folder> per unanswered Send
 asset-studio pending                  list unanswered Sends
+asset-studio request <id> --note <t> [--rect x0,y0,x1,y1]... [--ellipse ...]   file a Send from the CLI (agent batch fixes)
 asset-studio fix <folder> [--instruction <text>|--instruction-file <f>] [--agent claude|codex] [--dry-run]
 ```
 

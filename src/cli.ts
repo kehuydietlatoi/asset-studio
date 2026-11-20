@@ -3,6 +3,7 @@
  *   dev                         serve the studio page (http://127.0.0.1:5180 by default)
  *   watch                       print "NEW FEEDBACK: <folder>" for every unanswered Send (Claude mode)
  *   pending                     list unanswered Sends
+ *   accept|reject <assetId>     same as the page buttons for the current candidate
  *   request <assetId> --note <text> [--rect x0,y0,x1,y1]... [--ellipse x0,y0,x1,y1]...
  *                               file a Send from the command line (agent batch fixes); prints the folder
  *   fix <folder> [--instruction <text> | --instruction-file <file>] [--agent claude|codex] [--dry-run]
@@ -16,7 +17,7 @@ import { fixFeedback } from "./fixer.ts";
 import { startServer } from "./server.ts";
 import { PNG } from "pngjs";
 import { blank, readPng, type Img } from "./png.ts";
-import { getMeta, pendingFeedback, versionPath, writeAck, writeFeedback } from "./store.ts";
+import { getMeta, makeCurrent, pendingFeedback, rejectCandidate, versionPath, writeAck, writeFeedback } from "./store.ts";
 
 function toDataUrl(img: Img): string {
   const p = new PNG({ width: img.width, height: img.height });
@@ -58,6 +59,22 @@ async function main() {
     };
     tick();
     setInterval(tick, 2000);
+    return;
+  }
+
+  if (cmd === "accept" || cmd === "reject") {
+    // accept|reject <assetId>: same as the page buttons (accept writes the candidate to the game file)
+    if (!pos) throw new Error(`usage: ${cmd} <assetId>`);
+    const meta = getMeta(cfg, pos);
+    if (meta.candidate == null) throw new Error(`${pos}: no candidate`);
+    if (cmd === "accept") {
+      const n = meta.candidate;
+      makeCurrent(cfg, pos, n);
+      console.log(`${pos}: v${n} is current, written to ${cfg.byId.get(pos)!.file}`);
+    } else {
+      rejectCandidate(cfg, pos);
+      console.log(`${pos}: candidate rejected`);
+    }
     return;
   }
 

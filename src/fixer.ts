@@ -140,9 +140,14 @@ export async function fixFeedback(cfg: LoadedConfig, folder: string, opts: FixOp
 
   if (opts.dryRun) return { candidate: null, prompt: imagePrompt, workDir: work };
 
-  await runCodex(folder, images, agentPrompt, log);
   const rawPath = join(work, "edit-raw.png");
-  if (!existsSync(rawPath)) throw new Error("codex finished but work/edit-raw.png is missing");
+  await runCodex(folder, images, agentPrompt, log);
+  if (!existsSync(rawPath)) {
+    // Seen in practice: Codex occasionally ends without copying the image. One retry is enough.
+    log("codex did not save work/edit-raw.png, retrying once…");
+    await runCodex(folder, images, agentPrompt, log);
+  }
+  if (!existsSync(rawPath)) throw new Error("codex finished twice but work/edit-raw.png is missing");
 
   const edited = keyOut(resize(readPng(rawPath), W, H), key);
   const result = mask ? composite(before, edited, mask) : edited;

@@ -29,6 +29,43 @@ AI-generated raster art. Local only (binds to 127.0.0.1).
 2. From the game root: `node <path-to>/asset-studio/bin/asset-studio.mjs dev`, open http://127.0.0.1:5180.
 3. Add `.asset-studio/` to the game's `.gitignore` (local version history and feedback).
 
+## Board: audit a whole group in one pass
+
+The **Board** view shows a group (or all groups) as cards:
+
+- **Filters** with counts: not reviewed, needs fix, in review, approved, has candidate, marked (mark-up not sent
+  yet), fixing / failed.
+- **Select** cards with their checkbox (Shift-click selects a range), or "Select shown".
+- **Batch actions** on the selection: Approve, Needs fix, Accept candidates (writes the game files), Reject candidates.
+- **Send all marked** sends every asset on the board that has unsent mark-up. **Send note to selected** sends each
+  selected asset its own unsent mark-up plus one shared note (no mask means the whole image may change).
+- Click a card for its details in the right panel (you stay on the Board); double-click to open it for mark-up.
+
+Unsent mark-up is saved as a draft in `.asset-studio/drafts/`, so an audit survives a page reload.
+
+## Tags
+
+An image can be in any number of tags (faction, role, tier, "map objects"...). A tag only lists asset ids; no image is
+copied. Three kinds:
+
+- **Groups** from the config are tags.
+- **Config tags** pick members by id pattern: `*` stays inside one id segment, `**` matches anything.
+
+  ```js
+  tags: [
+    { id: "tier-2", label: "2★", match: "unit/*/s2" },
+    { id: "role-tank", label: "Tank", match: ["unit/ad_u_01/*", "unit/ad_u_08/*"] },
+    { id: "map-objects", label: "Map objects", match: ["hq/**", "set/**"], assets: ["icon/ad_s_02"] },
+  ],
+  ```
+
+- **Your tags**, made in the page: select cards on the Board, "Add selected to tag → New tag…". Rename, delete
+  and remove members on the Board when the tag is shown, or with the × on a tag chip in the right panel. Stored in
+  `.asset-studio/tags.json`.
+
+The Board's picker shows any tag; the left list switches between "By group" and "By tag". CLI: `asset-studio tags
+[<assetId>]`, `asset-studio tag new|add|remove|rename|delete ...`.
+
 ## Agents
 
 | Mode | Who answers a Send | Set up |
@@ -72,6 +109,8 @@ When someone reports a stuck job, ask them for `studio.log` and that Send's fold
 - `feedback/<id>/<stamp>/`: `notes.json`, `sketch.png`, `mask.png`, `photos/`, `before.png`, `status.json`,
   `ack.json`, `job.json` (fix state), `reply.json`, `work/` (prompts, `codex.log`, raw edit, composited result).
 - `logs/studio.log`: the studio log (see above).
+- `drafts/<id>.json`: unsent mark-up per asset.
+- `tags.json`: tags made in the page.
 
 ## Limits
 

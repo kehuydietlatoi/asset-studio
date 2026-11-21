@@ -11,6 +11,10 @@
  *                               store a candidate version and write reply.json
  *   jobs [--all]                every Send with its fix state (queued / running: stage + time / failed / interrupted)
  *   log [-n <lines>]            last lines of .asset-studio/logs/studio.log (default 80)
+ *   tags [<assetId>]            list every tag with its size (or the tags of one asset)
+ *   tag new <label> [<assetId>...]       create a tag (prints its id)
+ *   tag add|remove <tagId> <assetId>...  change a tag's members (tags made in the page or here only)
+ *   tag rename <tagId> <label> | tag delete <tagId>
  */
 import { existsSync, readFileSync } from "node:fs";
 import { basename, resolve } from "node:path";
@@ -18,6 +22,7 @@ import { loadConfig } from "./config.ts";
 import { fixFeedback } from "./fixer.ts";
 import { createLogger, tailLog } from "./log.ts";
 import { startServer } from "./server.ts";
+import { allTags, createTag, deleteTag, editTagAssets, renameTag, tagsOf } from "./tags.ts";
 import { PNG } from "pngjs";
 import { blank, readPng, type Img } from "./png.ts";
 import { allJobs, getMeta, jobLabel, makeCurrent, pendingFeedback, rejectCandidate, versionPath, writeAck, writeFeedback } from "./store.ts";
@@ -68,7 +73,35 @@ async function main() {
     return;
   }
 
+  if (cmd === "tags") {
+    const tags = pos ? tagsOf(cfg, pos) : allTags(cfg);
+    for (const t of tags) console.log(`${t.id.padEnd(24)} ${t.kind.padEnd(6)} ${String(t.assets.length).padStart(3)}  ${t.label}`);
+    if (!tags.length) console.log(pos ? `${pos} has no tags` : "no tags");
+    return;
+  }
+
   const L = createLogger(cfg.dataDir, { source: cmd, echo: false });
+
+  if (cmd === "tag") {
+    // argv: node, cli.ts, "tag", sub, a, ...rest (minus any --config <file>)
+    const [, , , sub, a, ...rest] = process.argv.filter((x) => x !== "--config" && x !== arg("config"));
+    if (sub === "new") {
+      const t = createTag(cfg, a, rest);
+      L.info(`tag created: "${t.label}" (${t.id}) with ${t.assets.length} asset(s)`);
+      console.log(t.id);
+    } else if (sub === "add" || sub === "remove") {
+      const n = editTagAssets(cfg, a, sub === "add" ? rest : [], sub === "remove" ? rest : []);
+      L.info(`tag ${a}: ${sub} ${rest.length} asset(s), now ${n}`);
+      console.log(`${a}: ${n} asset(s)`);
+    } else if (sub === "rename") {
+      renameTag(cfg, a, rest.join(" "));
+      L.info(`tag ${a} renamed to "${rest.join(" ")}"`);
+    } else if (sub === "delete") {
+      deleteTag(cfg, a);
+      L.info(`tag ${a} deleted`);
+    } else throw new Error("usage: tag new|add|remove|rename|delete ...");
+    return;
+  }
 
   if (cmd === "watch") {
     const seen = new Set<string>();

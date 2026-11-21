@@ -5,7 +5,7 @@
  *                                      status.json (written last = complete), ack.json, reply.json
  * <dir> is the asset id with "/" replaced by "__".
  */
-import { copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
+import { copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { LoadedConfig } from "./config.ts";
 import { fmtDuration } from "./log.ts";
@@ -212,6 +212,79 @@ export function writeAck(dir: string, by: string): void {
 
 export function writeReply(dir: string, reply: Reply): void {
   writeJson(join(dir, "reply.json"), reply);
+}
+
+// ---------------------------------------------------------------- board: batch actions + drafts
+
+export type BatchAction = "approve" | "needs_fix" | "accept" | "reject";
+export interface BatchResult {
+  id: string;
+  ok: boolean;
+  detail: string;
+}
+
+/** One action on many assets; one asset failing does not stop the others. */
+export function applyBatch(cfg: LoadedConfig, action: BatchAction, ids: string[]): BatchResult[] {
+  if (!["approve", "needs_fix", "accept", "reject"].includes(action)) throw new StoreError("bad batch action");
+  if (!Array.isArray(ids) || !ids.length) throw new StoreError("no assets selected");
+  return [...new Set(ids)].map((id) => {
+    try {
+      if (!cfg.byId.has(id)) throw new StoreError("unknown asset");
+      const meta = getMeta(cfg, id);
+      if (action === "approve" || action === "needs_fix") {
+        setStatus(cfg, id, action === "approve" ? "approved" : "needs_fix");
+        return { id, ok: true, detail: action === "approve" ? "approved" : "needs fix" };
+      }
+      if (meta.candidate == null) return { id, ok: false, detail: "no candidate" };
+      const n = meta.candidate;
+      if (action === "accept") {
+        makeCurrent(cfg, id, n);
+        return { id, ok: true, detail: `v${n} accepted` };
+      }
+      rejectCandidate(cfg, id);
+      return { id, ok: true, detail: `v${n} rejected` };
+    } catch (e) {
+      if (!(e instanceof StoreError)) throw e;
+      return { id, ok: false, detail: e.message };
+    }
+  });
+}
+
+/**
+ * Unsent mark-up per asset (`drafts/<dir>.json`), so a long audit survives a page reload. The page owns the
+ * shape; the store only checks it is a JSON object of sane size.
+ */
+const MAX_DRAFT = 40 * 1024 * 1024;
+
+function draftPath(cfg: LoadedConfig, id: string): string {
+  return join(cfg.dataDir, "drafts", `${dirOf(id)}.json`);
+}
+
+export function writeDraft(cfg: LoadedConfig, id: string, draft: unknown): void {
+  if (!cfg.byId.has(id)) throw new StoreError("unknown asset");
+  const p = draftPath(cfg, id);
+  if (draft == null) {
+    if (existsSync(p)) rmSync(p);
+    return;
+  }
+  if (typeof draft !== "object" || Array.isArray(draft)) throw new StoreError("draft must be an object");
+  const text = JSON.stringify(draft);
+  if (text.length > MAX_DRAFT) throw new StoreError("draft larger than 40 MB");
+  mkdirSync(join(cfg.dataDir, "drafts"), { recursive: true });
+  writeFileSync(p, text);
+}
+
+export function readDrafts(cfg: LoadedConfig): Record<string, unknown> {
+  const out: Record<string, unknown> = {};
+  for (const id of cfg.byId.keys()) {
+    try {
+      const d = readJson<unknown>(draftPath(cfg, id));
+      if (d) out[id] = d;
+    } catch {
+      /* a corrupt draft is dropped, not fatal */
+    }
+  }
+  return out;
 }
 
 // ---------------------------------------------------------------- jobs

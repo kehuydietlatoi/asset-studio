@@ -26,6 +26,18 @@ export interface GroupDef {
   assets: AssetDef[];
 }
 
+/**
+ * A tag defined in the config. Members are picked by id patterns (`*` = within one id segment, `**` = anything,
+ * so `unit/*\/s2` is every 2★ unit) and/or an explicit list. Assets added to the config later join by themselves.
+ * Every config group is also a tag; users can add their own tags in the page (`.asset-studio/tags.json`).
+ */
+export interface TagDef {
+  id: string;
+  label: string;
+  match?: string | string[];
+  assets?: string[];
+}
+
 export interface StudioConfig {
   name: string;
   /** Who answers a Send: `claude` (Claude Code via the skill + watcher) or `codex` (the server runs the fixer itself). */
@@ -39,6 +51,8 @@ export interface StudioConfig {
   /** Line-up stage look. */
   stage?: { sky?: string; ground?: string; groundY?: number };
   groups: GroupDef[];
+  /** Extra tags across groups (by role, faction, tier...). */
+  tags?: TagDef[];
   port?: number;
   /** Kill a Codex image edit that runs longer than this (minutes) and fail the job, so the queue moves on. Default 10. */
   fixTimeoutMin?: number;
@@ -54,6 +68,7 @@ export interface LoadedConfig extends StudioConfig {
 }
 
 const ID_RE = /^[A-Za-z0-9_.\-/]{1,120}$/;
+export const TAG_ID_RE = /^[A-Za-z0-9_.-]{1,60}$/;
 
 export function validateId(id: string): boolean {
   return ID_RE.test(id) && !id.includes("..") && !id.startsWith("/");
@@ -75,5 +90,13 @@ export async function loadConfig(path: string): Promise<LoadedConfig> {
     }
   }
   if (cfg.agent !== "claude" && cfg.agent !== "codex") throw new Error(`agent must be "claude" or "codex"`);
+  const tagIds = new Set(cfg.groups.map((g) => g.id));
+  for (const t of cfg.tags ?? []) {
+    if (!TAG_ID_RE.test(t.id)) throw new Error(`bad tag id: ${t.id} (letters, digits, _ - . only)`);
+    if (tagIds.has(t.id)) throw new Error(`tag id ${t.id} is already used by a group or another tag`);
+    if (t.id.startsWith("my-")) throw new Error(`tag id ${t.id}: the "my-" prefix is reserved for tags made in the page`);
+    if (!t.label?.trim()) throw new Error(`tag ${t.id} needs a label`);
+    tagIds.add(t.id);
+  }
   return { ...cfg, root, dataDir: resolve(root, ".asset-studio"), byId, abs };
 }

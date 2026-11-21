@@ -4,7 +4,8 @@ type Version = { n: number; at: string; source: string; parent?: number; prompt?
 type Meta = { id: string; status: string; current: number; candidate: number | null; versions: Version[] };
 type AssetRow = { id: string; label: string; scale: number; meta: Meta | null; job: string | null };
 type Group = { id: string; label: string; assets: AssetRow[] };
-type Project = { name: string; agent: string; stage: { sky?: string; ground?: string; groundY?: number }; groups: Group[] };
+type Tag = { id: string; label: string; kind: "group" | "config" | "user"; assets: string[] };
+type Project = { name: string; agent: string; stage: { sky?: string; ground?: string; groundY?: number }; groups: Group[]; tags: Tag[] };
 type ReplyNote = { pin: number | null; status: "fixed" | "question" | "wont"; text: string };
 type Feedback = { folder: string; ack: { by: string } | null; reply: { summary: string; notes: ReplyNote[]; candidate?: number } | null; job: string | null };
 
@@ -13,7 +14,9 @@ type Item =
   | { kind: "mask" | "pen"; w: number; pts: Pt[] }
   | { kind: "arrow"; a: Pt; b: Pt }
   | { kind: "pin"; x: number; y: number; text: string };
-type Markup = { items: Item[]; notes: string; photos: string[] };
+/** `sent`: this mark-up went out unchanged; any edit makes it "marked" (unsent) again. */
+type Markup = { items: Item[]; notes: string; photos: string[]; sent?: boolean };
+type PinItem = Extract<Item, { kind: "pin" }>;
 type Tool = "mask" | "pin" | "pen" | "arrow";
 
 const $ = <T extends HTMLElement = HTMLElement>(id: string) => document.getElementById(id) as T;
@@ -59,13 +62,76 @@ function loadImage(url: string): HTMLImageElement {
 }
 
 const allAssets = () => project?.groups.flatMap((gr) => gr.assets) ?? [];
+const esc = (s: string) => s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/"/g, "&quot;");
+const tagById = (id: string) => project?.tags.find((t) => t.id === id) ?? null;
+/** Tags of an asset; `withGroups` false leaves out its config group (already shown by the list). */
+const tagsOfAsset = (id: string, withGroups = true) => (project?.tags ?? []).filter((t) => (withGroups || t.kind !== "group") && t.assets.includes(id));
+const userTags = () => (project?.tags ?? []).filter((t) => t.kind === "user");
+
+async function tagOp(body: Record<string, unknown>, done: string) {
+  try {
+    await api("/tag", body);
+    toast(done);
+  } catch (e) {
+    toast((e as Error).message);
+  }
+  await refreshProject();
+}
+
+/** Asks for a name and creates a user tag holding `assets`. Returns the new tag id (or null). */
+async function newTag(assets: string[]): Promise<string | null> {
+  const label = prompt(`Name of the new tag${assets.length ? ` (${assets.length} asset(s) go in)` : ""}:`)?.trim();
+  if (!label) return null;
+  try {
+    const t = await api<Tag>("/tag", { op: "create", label, assets });
+    toast(`Tag "${t.label}" created`);
+    await refreshProject();
+    return t.id;
+  } catch (e) {
+    toast((e as Error).message);
+    return null;
+  }
+}
+
+/** Options for an "add to tag" select: every user tag + "New tag…". */
+const addTagOptions = (first: string) =>
+  `<option value="">${first}</option>` + userTags().map((t) => `<option value="${esc(t.id)}">${esc(t.label)}</option>`).join("") + `<option value="__new">＋ New tag…</option>`;
 const sel = () => allAssets().find((a) => a.id === selId) ?? null;
 const groupOfSel = () => project?.groups.find((gr) => gr.assets.some((a) => a.id === selId)) ?? null;
-function markup(): Markup {
-  if (!selId) return { items: [], notes: "", photos: [] };
-  let m = markups.get(selId);
-  if (!m) markups.set(selId, (m = { items: [], notes: "", photos: [] }));
+function markup(id = selId): Markup {
+  if (!id) return { items: [], notes: "", photos: [] };
+  let m = markups.get(id);
+  if (!m) markups.set(id, (m = { items: [], notes: "", photos: [] }));
   return m;
+}
+const pinsOf = (m: Markup) => m.items.filter((i): i is PinItem => i.kind === "pin");
+const hasMarkup = (m: Markup | undefined) => !!m && (pinsOf(m).length > 0 || m.notes.trim() !== "");
+/** Has mark-up that has not been sent yet. */
+const isMarked = (id: string) => hasMarkup(markups.get(id)) && !markups.get(id)!.sent;
+
+// Drafts: unsent mark-up is saved on the server (debounced), so a long audit survives a reload.
+const saveTimers = new Map<string, number>();
+function saveDraft(id: string) {
+  clearTimeout(saveTimers.get(id));
+  saveTimers.set(
+    id,
+    window.setTimeout(() => {
+      const m = markups.get(id);
+      const empty = !m || (!m.items.length && !m.notes.trim() && !m.photos.length);
+      api("/draft", { asset: id, draft: empty ? null : m }).catch((e) => toast(`Draft not saved: ${(e as Error).message}`));
+      renderList();
+    }, 600),
+  );
+}
+/** Call after every edit of the selected asset's mark-up. */
+function touch(id = selId) {
+  if (!id) return;
+  markup(id).sent = false;
+  saveDraft(id);
+}
+function forget(id: string) {
+  markups.delete(id);
+  saveDraft(id);
 }
 
 async function refreshProject() {
@@ -87,7 +153,6 @@ function toast(s: string) {
 function chip(a: AssetRow): string {
   if (a.job) {
     // Full text (stage, elapsed, queue place) on hover; the list only has room for the gist.
-    const esc = (s: string) => s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/"/g, "&quot;");
     const short = a.job.startsWith("Fix failed") ? "fix failed" : a.job.startsWith("Interrupted") ? "interrupted" : a.job.startsWith("Queued") ? "queued" : "fixing…";
     return `<span class="chip job" title="${esc(a.job)}">${short}</span>`;
   }
@@ -96,36 +161,196 @@ function chip(a: AssetRow): string {
   return `<span class="chip ${s}">${STATUS_LABEL[s] ?? s}${cand}</span>`;
 }
 
+const markedBadge = (id: string) => {
+  if (!isMarked(id)) return "";
+  const n = pinsOf(markups.get(id)!).length;
+  return `<span class="marked" title="Marked, not sent yet">✎${n ? ` ${n}` : ""}</span>`;
+};
+
+/** Left list: by config group (one place per asset) or by tag (an asset shows under each of its tags). */
+let listMode: "group" | "tag" = "group";
+try {
+  if (localStorage.getItem("asset-studio.listMode") === "tag") listMode = "tag";
+} catch {
+  /* storage blocked: default */
+}
+
 function renderList() {
   if (!project) return;
-  $("assetList").innerHTML = project.groups
-    .map(
-      (gr) =>
-        `<div class="group"><h3>${gr.label} (${gr.assets.length})</h3>` +
-        gr.assets
-          .map(
-            (a) =>
-              `<div class="asset ${a.id === selId ? "sel" : ""}" data-id="${a.id}"><img src="${a.meta ? imgUrl(a.id, a.meta.current) : ""}" alt="" /><span class="lbl">${a.label}</span>${chip(a)}</div>`,
-          )
-          .join("") +
-        `</div>`,
-    )
-    .join("");
+  const row = (a: AssetRow) =>
+    `<div class="asset ${a.id === selId ? "sel" : ""}" data-id="${a.id}"><img src="${a.meta ? imgUrl(a.id, a.meta.current) : ""}" alt="" /><span class="lbl">${esc(a.label)}</span>${markedBadge(a.id)}${chip(a)}</div>`;
+  const section = (label: string, rows: AssetRow[], kind = "") =>
+    `<div class="group"><h3>${kind ? `<span class="tk ${kind}" title="${kind === "user" ? "tag made in the page" : "tag from the config"}"></span>` : ""}${esc(label)} (${rows.length})</h3>${rows.map(row).join("")}</div>`;
+  const toggle = `<div class="listMode"><button data-list="group" class="${listMode === "group" ? "on" : ""}">By group</button><button data-list="tag" class="${listMode === "tag" ? "on" : ""}">By tag</button></div>`;
+  let body: string;
+  if (listMode === "group") body = project.groups.map((gr) => section(gr.label, gr.assets)).join("");
+  else {
+    const byId = new Map(allAssets().map((a) => [a.id, a]));
+    const tags = project.tags.filter((t) => t.kind !== "group");
+    const tagged = new Set(tags.flatMap((t) => t.assets));
+    const untagged = allAssets().filter((a) => !tagged.has(a.id));
+    body = tags.length
+      ? tags.map((t) => section(t.label, t.assets.map((id) => byId.get(id)!).filter(Boolean), t.kind)).join("") + (untagged.length ? section("Untagged", untagged) : "")
+      : `<p class="hint">No tags yet. Select cards on the Board and use "Add to tag", or add <code>tags</code> to the config.</p>`;
+  }
+  $("assetList").innerHTML = toggle + body;
   if (view === "board") renderBoard();
 }
 
+// ------------------------------------------------------------------ board (M3: audit a whole group in one pass)
+
+/** "" = the selected asset's group, "*" = every asset, else a tag id (groups are tags too). */
+let boardGroup = "";
+let boardFilter = "all";
+const picked = new Set<string>();
+let lastPick: string | null = null;
+let batchBusy = false;
+
+const FILTERS: { id: string; label: string; test: (a: AssetRow) => boolean }[] = [
+  { id: "all", label: "All", test: () => true },
+  { id: "generated", label: "Not reviewed", test: (a) => (a.meta?.status ?? "generated") === "generated" },
+  { id: "needs_fix", label: "Needs fix", test: (a) => a.meta?.status === "needs_fix" },
+  { id: "in_review", label: "In review", test: (a) => a.meta?.status === "in_review" },
+  { id: "approved", label: "Approved", test: (a) => a.meta?.status === "approved" },
+  { id: "candidate", label: "Has candidate", test: (a) => !!a.meta?.candidate },
+  { id: "marked", label: "Marked, not sent", test: (a) => isMarked(a.id) },
+  { id: "job", label: "Fixing / failed", test: (a) => !!a.job },
+];
+
+function boardPool(): AssetRow[] {
+  if (!project) return [];
+  if (boardGroup === "*") return allAssets();
+  const tag = boardGroup ? tagById(boardGroup) : null;
+  if (tag) {
+    const byId = new Map(allAssets().map((a) => [a.id, a]));
+    return tag.assets.map((id) => byId.get(id)!).filter(Boolean);
+  }
+  return (groupOfSel() ?? project.groups[0])?.assets ?? [];
+}
+const boardShown = () => boardPool().filter((FILTERS.find((f) => f.id === boardFilter) ?? FILTERS[0]).test);
+const pickedRows = () => allAssets().filter((a) => picked.has(a.id));
+
 function renderBoard() {
-  const gr = groupOfSel() ?? project?.groups[0];
-  if (!gr) return;
-  $("board").innerHTML = gr.assets
-    .map(
-      (a) =>
-        `<div class="card" data-id="${a.id}"><img src="${a.meta ? imgUrl(a.id, a.meta.candidate ?? a.meta.current) : ""}" alt="" /><div>${a.label}</div><div class="meta">${chip(a)}<span>${a.meta?.versions.length ?? 0} v</span></div></div>`,
-    )
-    .join("");
+  if (!project) return;
+  if (boardGroup && boardGroup !== "*" && !tagById(boardGroup)) boardGroup = ""; // tag deleted meanwhile
+  const groupSel = $<HTMLSelectElement>("boardGroup");
+  const optsOf = (kind: Tag["kind"], title: string) => {
+    const ts = project!.tags.filter((t) => t.kind === kind);
+    return ts.length ? `<optgroup label="${title}">${ts.map((t) => `<option value="${esc(t.id)}">${esc(t.label)} (${t.assets.length})</option>`).join("")}</optgroup>` : "";
+  };
+  const opts =
+    `<option value="">Group of the selected asset</option><option value="*">All assets (${allAssets().length})</option>` +
+    optsOf("group", "Groups") +
+    optsOf("config", "Tags (config)") +
+    optsOf("user", "My tags");
+  if (groupSel.dataset.opts !== opts) {
+    groupSel.innerHTML = opts;
+    groupSel.dataset.opts = opts;
+  }
+  groupSel.value = boardGroup;
+
+  // Tag tools: add the selection to a tag; manage the tag on screen when it is a user tag.
+  const shownTag = boardGroup ? tagById(boardGroup) : null;
+  const addSel = $<HTMLSelectElement>("bTagAdd");
+  const addOpts = addTagOptions("Add selected to tag…");
+  if (addSel.dataset.opts !== addOpts) {
+    addSel.innerHTML = addOpts;
+    addSel.dataset.opts = addOpts;
+  }
+  const own = shownTag?.kind === "user";
+  for (const id of ["bTagRemove", "bTagRename", "bTagDelete"]) $(id).classList.toggle("hidden", !own);
+  $("bTagInfo").textContent = shownTag && shownTag.kind !== "user" ? `"${shownTag.label}" comes from the config (edit it there)` : "";
+
+  const pool = boardPool();
+  $("boardFilters").innerHTML = FILTERS.map((f) => {
+    const n = pool.filter(f.test).length;
+    return `<button data-filter="${f.id}" class="${f.id === boardFilter ? "on" : ""}" ${n || f.id === "all" ? "" : "disabled"}>${f.label} <small>${n}</small></button>`;
+  }).join("");
+
+  const chosen = pickedRows();
+  const marked = pool.filter((a) => isMarked(a.id));
+  $("bCount").textContent = `${chosen.length} selected`;
+  $("bSendMarked").textContent = `Send all marked (${marked.length})`;
+  $("bSendNote").textContent = `Send note to selected (${chosen.length})`;
+  for (const id of ["bApprove", "bNeedsFix", "bAccept", "bReject", "bSendNote", "bTagRemove"]) ($(id) as HTMLButtonElement).disabled = batchBusy || !chosen.length;
+  addSel.disabled = batchBusy || !chosen.length;
+  ($("bAccept") as HTMLButtonElement).disabled ||= !chosen.some((a) => a.meta?.candidate);
+  ($("bReject") as HTMLButtonElement).disabled ||= !chosen.some((a) => a.meta?.candidate);
+  ($("bSendMarked") as HTMLButtonElement).disabled = batchBusy || !marked.length;
+
+  const shown = boardShown();
+  $("board").innerHTML = shown.length
+    ? shown
+        .map(
+          (a) =>
+            `<div class="card ${picked.has(a.id) ? "picked" : ""} ${a.id === selId ? "sel" : ""}" data-id="${a.id}" title="Click: details on the right · Double-click: open to mark up">` +
+            `<input type="checkbox" class="pick" data-pick="${a.id}" ${picked.has(a.id) ? "checked" : ""} title="Select (Shift: range)" />` +
+            `<img src="${a.meta ? imgUrl(a.id, a.meta.candidate ?? a.meta.current) : ""}" alt="" />` +
+            `<div class="lbl">${esc(a.label)}</div>` +
+            (() => {
+              const ts = tagsOfAsset(a.id, false);
+              return ts.length ? `<div class="tags">${ts.map((t) => `<span class="tag ${t.kind}">${esc(t.label)}</span>`).join("")}</div>` : "";
+            })() +
+            `<div class="meta">${chip(a)}${markedBadge(a.id)}<span>${a.meta ? `v${a.meta.candidate ?? a.meta.current}${a.meta.candidate ? " (cand.)" : ""}` : "missing"}</span></div></div>`,
+        )
+        .join("")
+    : `<div class="empty">No assets match this filter.</div>`;
 }
 
-function select(id: string) {
+function pick(id: string, on: boolean, range: boolean) {
+  const shown = boardShown().map((a) => a.id);
+  const ids = range && lastPick && shown.includes(lastPick) ? shown.slice(Math.min(shown.indexOf(lastPick), shown.indexOf(id)), Math.max(shown.indexOf(lastPick), shown.indexOf(id)) + 1) : [id];
+  for (const x of ids) on ? picked.add(x) : picked.delete(x);
+  lastPick = id;
+  renderBoard();
+}
+
+async function runBatch(action: "approve" | "needs_fix" | "accept" | "reject") {
+  const ids = pickedRows().map((a) => a.id);
+  if (!ids.length) return toast("Select assets first");
+  if (action === "accept" && !confirm(`Accept the candidate of ${ids.length} asset(s)? This writes the game files (older versions stay in the history).`)) return;
+  batchBusy = true;
+  renderBoard();
+  try {
+    const { results } = await api<{ results: { id: string; ok: boolean; detail: string }[] }>("/batch", { action, assets: ids });
+    if (action === "accept") results.filter((r) => r.ok).forEach((r) => forget(r.id));
+    const skipped = results.filter((r) => !r.ok);
+    toast(`${results.length - skipped.length} done${skipped.length ? `, ${skipped.length} skipped (${skipped[0].detail}${skipped.length > 1 ? ", …" : ""})` : ""}`);
+  } catch (e) {
+    toast((e as Error).message);
+  } finally {
+    batchBusy = false;
+    await refreshProject();
+  }
+}
+
+/** Send many assets one after another; one failure does not stop the rest. */
+async function sendMany(rows: AssetRow[], extraNote: string, what: string) {
+  if (!rows.length) return;
+  const noMask = rows.filter((a) => !(isMarked(a.id) && markups.get(a.id)!.items.some((i) => i.kind === "mask"))).length;
+  const warn = noMask ? `\n\n${noMask} of them have no mask: the agent may change the whole image there.` : "";
+  if (!confirm(`Send ${rows.length} asset(s) to the agent (${what})?${warn}`)) return;
+  batchBusy = true;
+  const failed: string[] = [];
+  for (const [i, a] of rows.entries()) {
+    $("bProgress").textContent = `Sending ${i + 1}/${rows.length}: ${a.label}…`;
+    renderBoard();
+    try {
+      // Mark-up already sent is not sent again; such an asset only gets the shared note (whole image, no mask).
+      await sendAsset(a, isMarked(a.id) ? markups.get(a.id)! : { items: [], notes: "", photos: [] }, extraNote);
+    } catch (e) {
+      failed.push(`${a.label}: ${(e as Error).message}`);
+    }
+  }
+  batchBusy = false;
+  $("bProgress").textContent = failed.length ? `Sent ${rows.length - failed.length}/${rows.length}. Not sent: ${failed.join(" · ")}` : `Sent ${rows.length} asset(s). Progress shows on each card.`;
+  lastReplyKey = "";
+  await refreshProject();
+  pollFeedback();
+}
+
+/** Select an asset; `open` switches to Focus (list clicks do, a single click on a Board card does not). */
+function select(id: string, open = true) {
   selId = id;
   viewVersion = null;
   compare = false;
@@ -134,7 +359,7 @@ function select(id: string) {
   renderList();
   renderPanel();
   pollFeedback();
-  setView("focus");
+  if (open) setView("focus");
 }
 
 // ------------------------------------------------------------------ panel
@@ -146,6 +371,18 @@ function renderPanel() {
   const s = a?.meta?.status ?? "";
   $("statusChip").className = `chip ${s}`;
   $("statusChip").textContent = a ? STATUS_LABEL[s] ?? s : "";
+  const tagsHtml = a
+    ? tagsOfAsset(a.id)
+        .map(
+          (t) =>
+            `<span class="tag ${t.kind}" title="${t.kind === "user" ? "tag made in the page" : t.kind === "group" ? "group from the config" : "tag from the config"}">${esc(t.label)}${t.kind === "user" ? `<button class="x" data-untag="${esc(t.id)}" title="Remove from this tag">×</button>` : ""}</span>`,
+        )
+        .join("") + `<select id="panelTagAdd">${addTagOptions("+ tag")}</select>`
+    : "";
+  if ($("assetTags").dataset.html !== tagsHtml) {
+    $("assetTags").innerHTML = tagsHtml;
+    $("assetTags").dataset.html = tagsHtml;
+  }
   const pins = m.items.filter((i): i is Extract<Item, { kind: "pin" }> => i.kind === "pin");
   const replyFor = (n: number) => lastFeedback?.reply?.notes.find((r) => r.pin === n);
   // Do not rebuild the inputs under the cursor while the owner types (periodic refresh), unless pins were added/removed.
@@ -219,8 +456,7 @@ function currentImage(): HTMLImageElement | null {
   return loadImage(imgUrl(a.id, viewVersion ?? a.meta.current));
 }
 
-function drawMarkup(ctx: CanvasRenderingContext2D, W: number, H: number) {
-  const m = markup();
+function drawMarkup(ctx: CanvasRenderingContext2D, W: number, H: number, m = markup()) {
   const masks = m.items.filter((i) => i.kind === "mask");
   if (masks.length) {
     const off = document.createElement("canvas");
@@ -376,6 +612,7 @@ function setView(v: typeof view) {
   $("toolbar").classList.toggle("hidden", v !== "focus");
   $("lineupWrap").classList.toggle("hidden", v !== "lineup");
   $("board").classList.toggle("hidden", v !== "board");
+  $("boardBar").classList.toggle("hidden", v !== "board");
   if (v === "board") renderBoard();
   render();
 }
@@ -401,6 +638,7 @@ stage.addEventListener("pointerdown", (e) => {
   if (tool === "pin") {
     e.preventDefault(); // otherwise the browser moves focus to the canvas after this handler
     markup().items.push({ kind: "pin", x: p[0], y: p[1], text: "" });
+    touch();
     renderPanel();
     render();
     setTimeout(() => {
@@ -425,54 +663,76 @@ stage.addEventListener("pointermove", (e) => {
   else if (drawing.kind === "mask" || drawing.kind === "pen") drawing.pts.push(p);
   render();
 });
-stage.addEventListener("pointerup", () => (drawing = null));
+stage.addEventListener("pointerup", () => {
+  if (drawing) touch();
+  drawing = null;
+});
 
 // ------------------------------------------------------------------ send
 
-function exportSketch(): string {
-  const prev = compare;
-  compare = false;
-  renderFocus();
-  const url = stage.toDataURL("image/png");
-  compare = prev;
-  renderFocus();
-  return url;
+function whenLoaded(im: HTMLImageElement): Promise<HTMLImageElement> {
+  if (im.complete && im.naturalWidth) return Promise.resolve(im);
+  return new Promise((res, rej) => {
+    im.addEventListener("load", () => res(im), { once: true });
+    im.addEventListener("error", () => rej(new Error("image failed to load")), { once: true });
+  });
 }
 
-function exportMask(): string | null {
-  const masks = markup().items.filter((i) => i.kind === "mask");
-  if (!masks.length) return null;
+/** Sketch (current version + mark-up) and mask (white = may change) of any asset, without touching the stage. */
+async function exportFor(a: AssetRow, m: Markup): Promise<{ sketch: string; mask: string | null }> {
+  const im = await whenLoaded(loadImage(imgUrl(a.id, a.meta!.current)));
+  const W = im.naturalWidth, H = im.naturalHeight;
+  const c = document.createElement("canvas");
+  c.width = W;
+  c.height = H;
+  const ctx = c.getContext("2d")!;
+  ctx.drawImage(im, 0, 0);
+  drawMarkup(ctx, W, H, m);
+  const masks = m.items.filter((i): i is Extract<Item, { kind: "mask" }> => i.kind === "mask");
+  if (!masks.length) return { sketch: c.toDataURL("image/png"), mask: null };
   const off = document.createElement("canvas");
-  off.width = stage.width;
-  off.height = stage.height;
+  off.width = W;
+  off.height = H;
   const o = off.getContext("2d")!;
   o.fillStyle = "#000";
-  o.fillRect(0, 0, off.width, off.height);
+  o.fillRect(0, 0, W, H);
   o.strokeStyle = o.fillStyle = "#fff";
   o.lineCap = o.lineJoin = "round";
-  for (const s of masks) strokePath(o, s as Extract<Item, { kind: "mask" }>);
-  return off.toDataURL("image/png");
+  for (const s of masks) strokePath(o, s);
+  return { sketch: c.toDataURL("image/png"), mask: off.toDataURL("image/png") };
+}
+
+/** Send one asset's mark-up (plus an optional shared note). Returns the feedback folder name. */
+async function sendAsset(a: AssetRow, m: Markup, extraNote = ""): Promise<string> {
+  const pins = pinsOf(m);
+  if (pins.some((p) => !p.text.trim())) throw new Error("every pin needs a text");
+  const notes = [m.notes.trim(), extraNote.trim()].filter(Boolean).join("\n");
+  if (!pins.length && !notes) throw new Error("add a pin or a note first");
+  if (!a.meta) throw new Error("the asset file is missing");
+  const { sketch, mask } = await exportFor(a, m);
+  const r = await api<{ folder: string; agent: string }>("/send", {
+    asset: a.id,
+    pins: pins.map((p) => ({ x: p.x, y: p.y, text: p.text })),
+    notes,
+    sketch,
+    mask,
+    photos: m.photos,
+  });
+  if (markups.has(a.id)) {
+    m.sent = true;
+    saveDraft(a.id);
+  }
+  return r.folder;
 }
 
 async function send() {
   const a = sel();
   if (!a) return;
-  const m = markup();
-  const pins = m.items.filter((i): i is Extract<Item, { kind: "pin" }> => i.kind === "pin");
-  if (pins.some((p) => !p.text.trim())) return toast("Every pin needs a text");
-  if (!pins.length && !m.notes.trim()) return toast("Add a pin or a note first");
   viewVersion = null;
   ($("send") as HTMLButtonElement).disabled = true;
   try {
-    const r = await api<{ folder: string; agent: string }>("/send", {
-      asset: a.id,
-      pins: pins.map((p) => ({ x: p.x, y: p.y, text: p.text })),
-      notes: m.notes,
-      sketch: exportSketch(),
-      mask: exportMask(),
-      photos: m.photos,
-    });
-    toast(`Sent (${r.folder})`);
+    const folder = await sendAsset(a, markup());
+    toast(`Sent (${folder})`);
     lastReplyKey = "";
     await refreshProject();
     pollFeedback();
@@ -487,8 +747,68 @@ async function send() {
 
 document.addEventListener("click", async (e) => {
   const t = e.target as HTMLElement;
+  // ---- tags
+  if (t.dataset.list) {
+    listMode = t.dataset.list as typeof listMode;
+    try {
+      localStorage.setItem("asset-studio.listMode", listMode);
+    } catch {
+      /* storage blocked */
+    }
+    return renderList();
+  }
+  if (t.dataset.untag && selId) return tagOp({ op: "assets", id: t.dataset.untag, remove: [selId] }, "Removed from tag");
+  if (t.id === "bTagRemove" && boardGroup) {
+    const ids = pickedRows().map((a) => a.id);
+    await tagOp({ op: "assets", id: boardGroup, remove: ids }, `${ids.length} removed from "${tagById(boardGroup)?.label}"`);
+    ids.forEach((id) => picked.delete(id));
+    return renderBoard();
+  }
+  if (t.id === "bTagRename" && boardGroup) {
+    const label = prompt("New name for the tag:", tagById(boardGroup)?.label ?? "")?.trim();
+    if (label) await tagOp({ op: "rename", id: boardGroup, label }, "Tag renamed");
+    return;
+  }
+  if (t.id === "bTagDelete" && boardGroup) {
+    const tag = tagById(boardGroup);
+    if (tag && confirm(`Delete the tag "${tag.label}"? Its ${tag.assets.length} image(s) stay where they are.`)) {
+      boardGroup = "";
+      await tagOp({ op: "delete", id: tag.id }, `Tag "${tag.label}" deleted`);
+    }
+    return;
+  }
+  // ---- board
+  if (t.dataset.pick) return pick(t.dataset.pick, (t as HTMLInputElement).checked, e.shiftKey);
+  const filterBtn = t.closest<HTMLElement>("[data-filter]");
+  if (filterBtn) {
+    boardFilter = filterBtn.dataset.filter!;
+    return renderBoard();
+  }
+  if (t.id === "bAll") {
+    boardShown().forEach((a) => picked.add(a.id));
+    return renderBoard();
+  }
+  if (t.id === "bNone") {
+    picked.clear();
+    return renderBoard();
+  }
+  if (t.id === "bApprove") return runBatch("approve");
+  if (t.id === "bNeedsFix") return runBatch("needs_fix");
+  if (t.id === "bAccept") return runBatch("accept");
+  if (t.id === "bReject") return runBatch("reject");
+  if (t.id === "bSendMarked") return sendMany(boardPool().filter((a) => isMarked(a.id)), "", "their own mark-up");
+  if (t.id === "bSendNote") {
+    const note = ($("bNote") as HTMLInputElement).value.trim();
+    const rows = pickedRows();
+    const bare = rows.filter((a) => !isMarked(a.id));
+    if (!note && bare.length) return toast(`Write a note first: ${bare.length} selected asset(s) have no mark-up of their own`);
+    await sendMany(rows, note, note ? `note: "${note}"` : "their own mark-up");
+    if (!$("bProgress").textContent?.includes("Not sent")) ($("bNote") as HTMLInputElement).value = "";
+    return;
+  }
+  // ---- list, focus, panel
   const row = t.closest<HTMLElement>("[data-id]");
-  if (row && (row.classList.contains("asset") || row.classList.contains("card"))) return select(row.dataset.id!);
+  if (row && (row.classList.contains("asset") || row.classList.contains("card"))) return select(row.dataset.id!, !row.classList.contains("card"));
   if (t.dataset.view && t.closest("#views")) return setView(t.dataset.view as typeof view);
   if (t.dataset.tool) {
     tool = t.dataset.tool as Tool;
@@ -497,6 +817,7 @@ document.addEventListener("click", async (e) => {
   }
   if (t.dataset.photo) {
     markup().photos.splice(Number(t.dataset.photo), 1);
+    touch();
     return renderPanel();
   }
   if (t.dataset.viewV) {
@@ -517,7 +838,7 @@ document.addEventListener("click", async (e) => {
       await api("/accept", { asset: a.id });
       compare = false;
       ($("compare") as HTMLInputElement).checked = false;
-      markups.delete(a.id);
+      forget(a.id);
       toast("Accepted: the game file is updated");
       return refreshProject().then(render);
     }
@@ -536,13 +857,38 @@ document.addEventListener("click", async (e) => {
 });
 
 $("send").addEventListener("click", send);
+$("board").addEventListener("dblclick", (e) => {
+  const card = (e.target as HTMLElement).closest<HTMLElement>(".card");
+  if (!card || (e.target as HTMLElement).dataset.pick) return;
+  select(card.dataset.id!);
+  setView("focus");
+});
+$("boardGroup").addEventListener("change", (e) => {
+  boardGroup = (e.target as HTMLSelectElement).value;
+  renderBoard();
+});
+/** "Add to tag" selects (Board: the selection; panel: the asset shown). "__new" makes a tag first. */
+async function addToTag(sel: HTMLSelectElement, ids: string[]) {
+  const v = sel.value;
+  sel.value = "";
+  if (!v || !ids.length) return;
+  if (v === "__new") return void (await newTag(ids));
+  await tagOp({ op: "assets", id: v, add: ids }, `${ids.length} added to "${tagById(v)?.label}"`);
+}
+$("bTagAdd").addEventListener("change", (e) => addToTag(e.target as HTMLSelectElement, pickedRows().map((a) => a.id)));
+$("assetTags").addEventListener("change", (e) => {
+  const t = e.target as HTMLSelectElement;
+  if (t.id === "panelTagAdd" && selId) addToTag(t, [selId]);
+});
 $("undo").addEventListener("click", () => {
   markup().items.pop();
+  touch();
   renderPanel();
   render();
 });
 $("clear").addEventListener("click", () => {
   markup().items = [];
+  touch();
   renderPanel();
   render();
 });
@@ -558,10 +904,13 @@ $("compare").addEventListener("change", (e) => {
 $("zoom").addEventListener("change", fitStage);
 $("pins").addEventListener("input", (e) => {
   const t = e.target as HTMLInputElement;
-  const pins = markup().items.filter((i): i is Extract<Item, { kind: "pin" }> => i.kind === "pin");
-  pins[Number(t.dataset.pin)].text = t.value;
+  pinsOf(markup())[Number(t.dataset.pin)].text = t.value;
+  touch();
 });
-$("notes").addEventListener("input", (e) => (markup().notes = (e.target as HTMLTextAreaElement).value));
+$("notes").addEventListener("input", (e) => {
+  markup().notes = (e.target as HTMLTextAreaElement).value;
+  touch();
+});
 lineup.addEventListener("click", (e) => {
   const gr = groupOfSel() ?? project?.groups[0];
   if (!gr) return;
@@ -585,6 +934,7 @@ function addPhoto(file: File) {
   const fr = new FileReader();
   fr.onload = () => {
     m.photos.push(String(fr.result));
+    touch();
     renderPanel();
   };
   fr.readAsDataURL(file);
@@ -605,9 +955,13 @@ document.addEventListener("keydown", (e) => {
 });
 window.addEventListener("resize", () => view === "focus" && fitStage());
 
-refreshProject().then(() => {
-  const first = allAssets()[0];
-  if (first) select(first.id);
-});
+api<Record<string, Markup>>("/drafts")
+  .then((d) => Object.entries(d).forEach(([id, m]) => markups.set(id, m)))
+  .catch(() => toast("Could not load saved drafts"))
+  .then(refreshProject)
+  .then(() => {
+    const first = allAssets()[0];
+    if (first) select(first.id);
+  });
 setInterval(pollFeedback, 2000);
 setInterval(() => refreshProject().catch(() => {}), 6000);

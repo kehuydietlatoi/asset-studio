@@ -7,22 +7,27 @@ import { createServer, type Plugin } from "vite";
 import type { LoadedConfig } from "./config.ts";
 import { fixFeedback } from "./fixer.ts";
 import { createLogger, tailLog, type Logger } from "./log.ts";
+import { allTags, createTag, deleteTag, editTagAssets, renameTag } from "./tags.ts";
 import {
   allJobs,
+  applyBatch,
   getMeta,
   isInterrupted,
   jobLabel,
   latestFeedback,
   makeCurrent,
   pendingFeedback,
+  readDrafts,
   readJob,
   rejectCandidate,
   setStatus,
   StoreError,
   versionPath,
+  writeDraft,
   writeFeedback,
   writeJob,
   writeReply,
+  type BatchAction,
   type ReviewStatus,
   type SendPayload,
 } from "./store.ts";
@@ -90,6 +95,7 @@ function api(cfg: LoadedConfig, L: Logger): Plugin {
     name: cfg.name,
     agent: cfg.agent,
     stage: cfg.stage ?? {},
+    tags: allTags(cfg),
     groups: cfg.groups.map((g) => ({
       id: g.id,
       label: g.label,
@@ -207,6 +213,40 @@ function api(cfg: LoadedConfig, L: Logger): Plugin {
               L.scope(id).info(`reverted to v${Number(b.v)}`);
               return makeCurrent(cfg, id, Number(b.v));
             });
+          if (req.method === "POST" && url.pathname === "/batch")
+            return body((b: { action: BatchAction; assets: string[] }) => {
+              const results = applyBatch(cfg, b.action, b.assets);
+              const ok = results.filter((r) => r.ok).length;
+              L.info(`batch ${b.action}: ${ok}/${results.length} ok${results.some((r) => !r.ok) ? ` (skipped: ${results.filter((r) => !r.ok).map((r) => `${r.id} ${r.detail}`).join(", ")})` : ""}`);
+              return { results };
+            });
+          if (req.method === "POST" && url.pathname === "/tag")
+            return body((b: { op: string; id?: string; label?: string; assets?: string[]; add?: string[]; remove?: string[] }) => {
+              const id = String(b.id ?? "");
+              if (b.op === "create") {
+                const t = createTag(cfg, b.label, b.assets ?? []);
+                L.info(`tag created: "${t.label}" (${t.id}) with ${t.assets.length} asset(s)`);
+                return t;
+              }
+              if (b.op === "rename") {
+                renameTag(cfg, id, b.label);
+                L.info(`tag ${id} renamed to "${String(b.label).trim()}"`);
+                return { ok: true };
+              }
+              if (b.op === "delete") {
+                deleteTag(cfg, id);
+                L.info(`tag ${id} deleted`);
+                return { ok: true };
+              }
+              if (b.op === "assets") {
+                const n = editTagAssets(cfg, id, b.add ?? [], b.remove ?? []);
+                L.info(`tag ${id}: +${b.add?.length ?? 0} -${b.remove?.length ?? 0} asset(s), now ${n}`);
+                return { ok: true, count: n };
+              }
+              throw new StoreError("bad tag op");
+            });
+          if (req.method === "GET" && url.pathname === "/drafts") return json(200, readDrafts(cfg));
+          if (req.method === "POST" && url.pathname === "/draft") return body((b) => writeDraft(cfg, need(b), b.draft ?? null));
           if (req.method === "POST" && url.pathname === "/status")
             return body((b) => {
               if (!STATUSES.includes(b.status)) throw new StoreError("bad status");

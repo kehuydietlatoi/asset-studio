@@ -108,3 +108,46 @@ textarea { width: 100%; background: var(--bg); color: var(--text); border: 1px s
 #bProgress:empty { display: none; }
 .card img { width: 100%; aspect-ratio: 1; object-fit: contain; background: #e6d6b0; border-radius: 5px; }
 .card .meta { display: flex; justify-content: space-between; align-items: center; font-size: 12px; gap: 4px; }
+
+/* ------------------------------------------------------------------ narrow windows (side panes, small laptops) */
+@media (max-width: 1150px) {
+  main { grid-template-columns: 200px 1fr 280px; }
+  #board { grid-template-columns: repeat(auto-fill, minmax(140px, 1fr)); gap: 8px; padding: 8px; }
+}
+@media (max-width: 900px) {
+  /* Asset list becomes a thumbnail rail; name and status are in each row's tooltip. */
+  main { grid-template-columns: 64px 1fr 250px; }
+  #assetList { padding: 6px 4px; }
+  #assetList .lbl, #assetList .chip, #assetList .marked, #assetList .hint { display: none; }
+  #assetList .asset { justify-content: center; padding: 3px; position: relative; border-left: 3px solid transparent; }
+  #assetList .asset img { width: 44px; height: 44px; }
+  #assetList .asset.st-needs_fix { border-left-color: #c8673f; }
+  #assetList .asset.st-in_review { border-left-color: #6d9ee0; }
+  #assetList .asset.st-approved { border-left-color: var(--ok); }
+  #assetList .asset.is-marked::after,
+  #assetList .asset.has-job::after { content: ""; position: absolute; top: 3px; right: 3px; width: 8px; height: 8px; border-radius: 50%; background: #d58ee0; }
+  #assetList .asset.has-job::after { background: #f5dc9b; }
+  #assetList .group h3 { font-size: 9px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; margin: 8px 0 4px; }
+  #assetList .group h3 .tk { display: none; }
+  .listMode { flex-direction: column; gap: 2px; }
+  .listMode button { font-size: 10px; padding: 2px; }
+
+  header { gap: 6px; padding: 6px 8px; }
+  #views { margin-left: 4px; }
+  #projectName { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 160px; }
+  .badge { display: none; }
+  aside#panel { padding: 8px; }
+
+  /* Board bar: one scrolling row of filters, smaller controls. */
+  #boardBar { padding: 6px 8px; gap: 4px; }
+  #boardBar button, #boardBar select, #bNote { font-size: 12px; padding: 3px 7px; }
+  #boardFilters { flex-wrap: nowrap; overflow-x: auto; max-width: 100%; scrollbar-width: thin; }
+  #boardFilters button { flex: none; }
+  #boardBar .bRow:first-child { flex-wrap: nowrap; min-width: 0; }
+  #boardGroup { max-width: 150px; }
+  #bNote { min-width: 120px; }
+  #bTagInfo { display: none; }
+  #board { grid-template-columns: repeat(auto-fill, minmax(118px, 1fr)); gap: 6px; padding: 6px; }
+  .card { padding: 6px; gap: 4px; }
+  .card .pick { top: 9px; left: 9px; }
+}

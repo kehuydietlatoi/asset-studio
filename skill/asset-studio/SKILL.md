@@ -16,6 +16,9 @@ game repo root (the folder with `asset-studio.config.mjs`).
    URL. Port 5180 by default (`port` in the config).
 2. **Watch.** Run `node <studio>/bin/asset-studio.mjs watch` with the Monitor tool. It prints
    `NEW FEEDBACK: <folder>` per Send and writes `ack.json` (by watcher) so the page says "Received".
+   A Board batch ("Send all marked", "Send note to selected") arrives as several `NEW FEEDBACK` lines, one folder per
+   asset: answer them one at a time, oldest first, each with its own `fix`. Notes from "Send note to selected" are
+   the same text on every asset; still read each sketch, the right edit differs per image.
 3. **Read the Send** in `<folder>`: `notes.json` (pins with text, general note), `sketch.png` (what the owner saw with
    their mark-up: look at it), `mask.png` (white = may change), `photos/`, `before.png`.
 4. **Write the instruction.** One short paragraph per pin: what to remove, what to put there, what must stay. Use the

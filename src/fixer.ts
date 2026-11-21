@@ -77,6 +77,8 @@ interface CodexRun {
 }
 
 const HEARTBEAT_MS = 30_000;
+/** After codex exits, how long to wait for its output pipes to close before going on without them. */
+const EXIT_GRACE_MS = 5_000;
 
 /** Kill a process and everything it started (codex is a .cmd shim on Windows: cmd.exe -> node -> ...). */
 function killTree(pid: number | undefined): void {
@@ -141,12 +143,27 @@ function runCodex(cwd: string, images: string[], prompt: string, o: CodexRun): P
     child.stdout.on("data", keep);
     child.stderr.on("data", keep);
     child.on("error", (e) => finish(e));
-    child.on("close", (code, signal) => {
+    const ended = (code: number | null, signal: NodeJS.Signals | null) => {
       if (timedOut) return finish(new Error(`codex timed out after ${fmtDuration(o.timeoutMs)}; see ${o.logPath}`));
       o.L.info(`codex attempt ${o.attempt} exited ${code ?? signal} after ${fmtDuration(Date.now() - t0)} (${bytes} bytes of output)`);
       if (code === 0) finish();
       else finish(new Error(`codex exited ${code ?? signal}: ${tail.slice(-800)}`));
+    };
+    // `close` waits for the process AND its output pipes. A helper process codex leaves behind can hold the pipes
+    // open after codex itself has exited, so `close` would never come and a finished edit would wait for the
+    // timeout. `exit` fires when the process ends: give the pipes a moment to flush, then go on without them.
+    child.on("exit", (code, signal) => {
+      if (timedOut) return;
+      setTimeout(() => {
+        if (settled) return;
+        o.L.warn(`codex attempt ${o.attempt} exited ${code ?? signal} but its output pipe is still open after ${EXIT_GRACE_MS / 1000}s (a leftover helper process holds it); continuing without it`);
+        // Do not kill by pid here: codex is gone and its pid may already belong to an unrelated process.
+        child.stdout.destroy();
+        child.stderr.destroy();
+        ended(code, signal);
+      }, EXIT_GRACE_MS).unref();
     });
+    child.on("close", ended);
     child.stdin.on("error", () => {}); // codex may exit before reading stdin; the close handler reports it
     child.stdin.end(prompt);
   });

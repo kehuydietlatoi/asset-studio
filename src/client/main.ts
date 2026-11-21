@@ -178,7 +178,7 @@ try {
 function renderList() {
   if (!project) return;
   const row = (a: AssetRow) =>
-    `<div class="asset ${a.id === selId ? "sel" : ""}" data-id="${a.id}"><img src="${a.meta ? imgUrl(a.id, a.meta.current) : ""}" alt="" /><span class="lbl">${esc(a.label)}</span>${markedBadge(a.id)}${chip(a)}</div>`;
+    `<div class="asset ${a.id === selId ? "sel" : ""} st-${a.meta?.status ?? "generated"}${isMarked(a.id) ? " is-marked" : ""}${a.job ? " has-job" : ""}" data-id="${a.id}" title="${esc(a.label)} · ${STATUS_LABEL[a.meta?.status ?? "generated"] ?? ""}${a.job ? ` · ${esc(a.job)}` : ""}"><img src="${a.meta ? imgUrl(a.id, a.meta.current) : ""}" alt="" /><span class="lbl">${esc(a.label)}</span>${markedBadge(a.id)}${chip(a)}</div>`;
   const section = (label: string, rows: AssetRow[], kind = "") =>
     `<div class="group"><h3>${kind ? `<span class="tk ${kind}" title="${kind === "user" ? "tag made in the page" : "tag from the config"}"></span>` : ""}${esc(label)} (${rows.length})</h3>${rows.map(row).join("")}</div>`;
   const toggle = `<div class="listMode"><button data-list="group" class="${listMode === "group" ? "on" : ""}">By group</button><button data-list="tag" class="${listMode === "tag" ? "on" : ""}">By tag</button></div>`;

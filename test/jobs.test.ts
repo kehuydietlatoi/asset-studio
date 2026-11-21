@@ -19,11 +19,17 @@ beforeAll(() => {
   writeFileSync(
     join(bin, "fake-codex.mjs"),
     `import { copyFileSync, readFileSync } from "node:fs";
+import { spawn } from "node:child_process";
 const notes = readFileSync("notes.json", "utf8");
 process.stdin.resume();
 console.log("fake codex: started");
 if (notes.includes("hang")) setInterval(() => {}, 1e9);
-else { copyFileSync("work/input.png", "work/edit-raw.png"); console.log("saved work/edit-raw.png"); process.exit(0); }
+else {
+  // "leak": leave a detached helper that inherits (and so holds open) our stdout/stderr for 8 s after we exit.
+  // Detached matters: on Windows a non-detached child does not keep the pipe open (checked by hand).
+  if (notes.includes("leak")) spawn(process.execPath, ["-e", "setTimeout(() => {}, 8000)"], { stdio: "inherit", detached: true }).unref();
+  copyFileSync("work/input.png", "work/edit-raw.png"); console.log("saved work/edit-raw.png"); process.exit(0);
+}
 `,
   );
   writeFileSync(join(bin, "codex.cmd"), `@node "%~dp0fake-codex.mjs" %*\r\n`);
@@ -88,6 +94,16 @@ describe("fix with a fake codex", () => {
     expect(readJob(f)).toMatchObject({ state: "done", candidate: 2 });
     expect(readFileSync(join(f, "work", "codex.log"), "utf8")).toContain("fake codex: started");
     expect(tailLog(cfg.dataDir, 50)).toContain("fix done, candidate v2");
+  }, 20_000);
+
+  it("finishes when codex exits even if a leftover helper keeps its output pipe open", async () => {
+    const { cfg, send } = await project();
+    const f = send("leak a pipe");
+    const t0 = Date.now();
+    const r = await fixFeedback(cfg, f, { agent: "codex", logger: createLogger(cfg.dataDir, { echo: false }) });
+    expect(r.candidate).toBe(2);
+    expect(Date.now() - t0).toBeLessThan(7500); // 5 s grace, not the helper's 8 s, and nowhere near the timeout
+    expect(tailLog(cfg.dataDir, 50)).toMatch(/output pipe is still open/);
   }, 20_000);
 
   it("times out a hanging codex, kills it and marks the job failed", async () => {

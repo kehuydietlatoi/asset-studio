@@ -1,15 +1,16 @@
 /**
  * Raster fixer: answers one Send by editing the image with Codex's built-in image generation, then
  * compositing the result back ONLY inside the owner's mask, so nothing outside the marked area can drift.
- * The result becomes a candidate version; the owner accepts or rejects it in the studio.
+ * A Generate request (`mode: "generate"`) instead draws a new image from the asset's brief, as one image or as a
+ * grid of matching variants. The result becomes a candidate version; the owner accepts or rejects it in the studio.
  */
 import { spawn, spawnSync } from "node:child_process";
 import { createWriteStream, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { basename, join } from "node:path";
-import type { LoadedConfig } from "./config.ts";
+import { gridOf, type AssetDef, type LoadedConfig } from "./config.ts";
 import { createLogger, fmtDuration, type Logger } from "./log.ts";
-import { blank, composite, flatten, keyOut, maskCoverage, maskFrom, readPng, resize, softenMask, writePng, type Img } from "./png.ts";
-import { addCandidate, readNotes, writeAck, writeJob, writeReply, type Job, type Notes } from "./store.ts";
+import { blank, composite, flatten, isEmpty, keyOut, maskCoverage, maskFrom, readPng, resize, softenMask, touchesEdge, writePng, type Img } from "./png.ts";
+import { addCandidate, readNotes, sheetSize, splitVariants, writeAck, writeJob, writeReply, type Job, type Notes } from "./store.ts";
 
 export interface FixOptions {
   /** Replace the generated edit instruction (Claude writes a better one after reading the sketch). */
@@ -33,6 +34,27 @@ export interface FixResult {
 const MASK_GROW = 18; // px: owners rarely paint to the exact edge of the thing they want gone
 const MASK_FEATHER = 6; // px: soft seam between old and new pixels
 
+/** Image prompt for a Generate request: the brief, the canvas and, for a variant set, the grid. */
+export function buildGeneratePrompt(a: Pick<AssetDef, "brief" | "variants" | "size">, note: string, hex: string, refCount: number): string {
+  const [W, H] = sheetSize(a);
+  const n = a.variants ?? 1;
+  const [cols, rows] = gridOf(n);
+  const lines = ["GENERATE TASK. Draw a NEW image from the brief below; there is no current image to keep."];
+  if (n > 1) {
+    const cw = W / cols, ch = H / rows;
+    lines.push(
+      `Make ONE ${W}x${H} image on a perfectly flat ${hex} background, divided (invisibly, draw NO lines or frames) into a grid of ${cols} columns x ${rows} rows of equal ${cw}x${ch} cells.`,
+      `Draw ${n} DIFFERENT VARIANTS of the same subject, one per cell, filling the cells left to right, top to bottom${n < cols * rows ? `; leave the last ${cols * rows - n} cell(s) completely empty ${hex}` : ""}.`,
+      "Every variant: same size, same style, same palette, same line weight, centred in its cell, with at least 10% empty margin on every side; nothing may cross into another cell.",
+      "Vary only the shape (silhouette, curl, angle), so the variants can be swapped frame to frame as one animated effect.",
+    );
+  } else lines.push(`Make ONE ${W}x${H} image on a perfectly flat ${hex} background, the subject centred with at least 6% empty margin on every side.`);
+  if (refCount) lines.push(`The ${refCount} attached image(s) are REFERENCES only (style, or what the piece sits on): do not copy their subject into the image.`);
+  lines.push("", "BRIEF:", a.brief?.trim() || "(none)");
+  if (note.trim()) lines.push("", "ALSO:", note.trim());
+  return lines.join("\n");
+}
+
 export function buildInstruction(n: Notes, brief?: string): string {
   const lines: string[] = [];
   if (brief) lines.push(`Asset: ${brief}`);
@@ -44,9 +66,11 @@ export function buildInstruction(n: Notes, brief?: string): string {
   return lines.join("\n");
 }
 
-function styleText(cfg: LoadedConfig): string {
-  if (!cfg.styleBlock) return "";
-  return readFileSync(cfg.abs(cfg.styleBlock), "utf8")
+/** The style block that starts every prompt: the asset's own if it has one, else the project's. */
+function styleText(cfg: LoadedConfig, asset?: AssetDef): string {
+  const file = asset?.styleBlock ?? cfg.styleBlock;
+  if (!file) return "";
+  return readFileSync(cfg.abs(file), "utf8")
     .split(/\r?\n/)
     .filter((l) => !l.startsWith("#"))
     .join("\n")
@@ -184,7 +208,11 @@ export async function fixFeedback(cfg: LoadedConfig, folder: string, opts: FixOp
     job({ stage: s, ...patch });
   };
   job({ state: "running", stage, agent: opts.agent, startedAt: new Date().toISOString(), pid: undefined, attempt: undefined, endedAt: undefined });
-  L.info(`${send}: fix started (agent ${opts.agent}, from v${notes.version}, ${notes.pins.length} pin(s), mask ${notes.hasMask ? "yes" : "no"})`);
+  L.info(
+    notes.mode === "generate"
+      ? `${send}: generate started (agent ${opts.agent}, ${cfg.byId.get(notes.asset)?.variants ?? 1} variant(s))`
+      : `${send}: fix started (agent ${opts.agent}, from v${notes.version}, ${notes.pins.length} pin(s), mask ${notes.hasMask ? "yes" : "no"})`,
+  );
   try {
     const r = await prepareAndRun(cfg, folder, notes, opts, L, setStage);
     job({ state: "done", stage: "done", candidate: r.candidate ?? undefined, endedAt: new Date().toISOString(), pid: undefined });
@@ -214,6 +242,7 @@ async function prepareAndRun(
   const key = cfg.keyColor ?? [255, 0, 255];
   const work = join(folder, "work");
   mkdirSync(work, { recursive: true });
+  if (notes.mode === "generate") return generate(cfg, folder, notes, asset, opts, L, setStage, key, work);
   const before = readPng(join(folder, "before.png"));
   const W = before.width, H = before.height;
   const input = flatten(before, key);
@@ -229,13 +258,13 @@ async function prepareAndRun(
       images.push(join(work, "mask-guide.png"));
     }
   }
-  const refs = (cfg.styleRefs ?? []).map((r) => cfg.abs(r)).filter((r) => existsSync(r));
+  const refs = refsOf(cfg, asset);
   images.push(...refs);
 
   const instruction = opts.instruction?.trim() || buildInstruction(notes, asset.brief);
   const hex = "#" + key.map((c) => c.toString(16).padStart(2, "0")).join("").toUpperCase();
   const imagePrompt = [
-    styleText(cfg),
+    styleText(cfg, asset),
     "",
     "EDIT TASK. The first attached image is the CURRENT asset. Reproduce it exactly: same character, pose, framing, size,",
     `outline, colours and print texture, on the same flat ${hex} background, ${W}x${H}.`,
@@ -263,26 +292,7 @@ async function prepareAndRun(
 
   if (opts.dryRun) return { candidate: null, prompt: imagePrompt, workDir: work };
 
-  const rawPath = join(work, "edit-raw.png");
-  const timeoutMs = opts.timeoutMs ?? (cfg.fixTimeoutMin ?? 10) * 60_000;
-  const codex = (attempt: number) => {
-    setStage(`codex image edit (attempt ${attempt})`, { attempt });
-    return runCodex(folder, images, agentPrompt, {
-      attempt,
-      timeoutMs,
-      logPath: join(work, "codex.log"),
-      L,
-      onSpawn: (pid) => setStage(`codex image edit (attempt ${attempt})`, { attempt, pid }),
-      onHeartbeat: () => setStage(`codex image edit (attempt ${attempt})`, { attempt }),
-    });
-  };
-  await codex(1);
-  if (!existsSync(rawPath)) {
-    // Seen in practice: Codex occasionally ends without copying the image. One retry is enough.
-    L.warn("codex did not save work/edit-raw.png, retrying once");
-    await codex(2);
-  }
-  if (!existsSync(rawPath)) throw new Error("codex finished twice but work/edit-raw.png is missing");
+  const rawPath = await codexImage(cfg, folder, images, agentPrompt, opts, L, setStage, "codex image edit");
 
   setStage("compositing the edit into the mask", { pid: undefined });
   const edited = keyOut(resize(readPng(rawPath), W, H), key);
@@ -303,4 +313,98 @@ async function prepareAndRun(
     candidate: n,
   });
   return { candidate: n, prompt: imagePrompt, workDir: work };
+}
+
+/** Style refs from the config plus the asset's own refs, those that exist. */
+function refsOf(cfg: LoadedConfig, asset: AssetDef): string[] {
+  return [...(cfg.styleRefs ?? []), ...(asset.refs ?? [])].map((r) => cfg.abs(r)).filter((r) => existsSync(r));
+}
+
+/** Run Codex image generation (one retry if it forgets to save) and return the path of work/edit-raw.png. */
+async function codexImage(
+  cfg: LoadedConfig,
+  folder: string,
+  images: string[],
+  agentPrompt: string,
+  opts: FixOptions,
+  L: Logger,
+  setStage: (s: string, patch?: Partial<Job>) => void,
+  what: string,
+): Promise<string> {
+  const work = join(folder, "work");
+  const rawPath = join(work, "edit-raw.png");
+  const timeoutMs = opts.timeoutMs ?? (cfg.fixTimeoutMin ?? 10) * 60_000;
+  const codex = (attempt: number) => {
+    setStage(`${what} (attempt ${attempt})`, { attempt });
+    return runCodex(folder, images, agentPrompt, {
+      attempt,
+      timeoutMs,
+      logPath: join(work, "codex.log"),
+      L,
+      onSpawn: (pid) => setStage(`${what} (attempt ${attempt})`, { attempt, pid }),
+      onHeartbeat: () => setStage(`${what} (attempt ${attempt})`, { attempt }),
+    });
+  };
+  await codex(1);
+  if (!existsSync(rawPath)) {
+    // Seen in practice: Codex occasionally ends without copying the image. One retry is enough.
+    L.warn("codex did not save work/edit-raw.png, retrying once");
+    await codex(2);
+  }
+  if (!existsSync(rawPath)) throw new Error("codex finished twice but work/edit-raw.png is missing");
+  return rawPath;
+}
+
+/** Answer a Generate request: draw a new image (or variant sheet) from the brief and store it as a candidate. */
+async function generate(
+  cfg: LoadedConfig,
+  folder: string,
+  notes: Notes,
+  asset: AssetDef,
+  opts: FixOptions,
+  L: Logger,
+  setStage: (s: string, patch?: Partial<Job>) => void,
+  key: [number, number, number],
+  work: string,
+): Promise<FixResult> {
+  const [W, H] = sheetSize(asset);
+  const refs = refsOf(cfg, asset);
+  const hex = "#" + key.map((c) => c.toString(16).padStart(2, "0")).join("").toUpperCase();
+  // Claude may pass a sharper instruction; it replaces the note, the brief and grid rules stay.
+  const note = opts.instruction?.trim() || notes.notes;
+  const imagePrompt = [styleText(cfg, asset), "", buildGeneratePrompt(asset, note, hex, refs.length)].join("\n");
+  writeFileSync(join(work, "image-prompt.txt"), imagePrompt);
+  const agentPrompt = [
+    "You are an image-generation step in a game art pipeline.",
+    refs.length ? `Use your built-in image generation tool (image_gen) with ALL ${refs.length} attached images as visual references.` : "Use your built-in image generation tool (image_gen).",
+    "Use the full text of the file work/image-prompt.txt (in the current folder) unchanged as the image prompt.",
+    "Do NOT draw with code, SVG, PIL or any script: the image must come from image generation.",
+    "Save the generated image as work/edit-raw.png in the current folder (copy it from wherever generated images are stored).",
+    "Do not create or change any other file. When done, print the saved path.",
+  ].join("\n");
+  writeFileSync(join(work, "agent-prompt.txt"), agentPrompt);
+  if (opts.dryRun) return { candidate: null, prompt: imagePrompt, workDir: work };
+
+  const rawPath = await codexImage(cfg, folder, refs, agentPrompt, opts, L, setStage, "codex image generation");
+  setStage("keying out the background", { pid: undefined });
+  const result = keyOut(resize(readPng(rawPath), W, H), key);
+  const resultPath = join(work, "result.png");
+  writePng(resultPath, result);
+
+  const n = asset.variants ?? 1;
+  const warnings: string[] = [];
+  if (n > 1) {
+    splitVariants(result, n).forEach((v, k) => {
+      if (isEmpty(v)) warnings.push(`variant ${k + 1} is empty`);
+      else if (touchesEdge(v)) warnings.push(`variant ${k + 1} touches its cell edge (may be cut off)`);
+    });
+  } else if (touchesEdge(result)) warnings.push("the image touches the canvas edge (may be cut off)");
+
+  const c = addCandidate(cfg, notes.asset, resultPath, { source: "generate", prompt: note || asset.brief, feedback: folder, agent: opts.agent });
+  writeReply(folder, {
+    summary: `Generated v${c}${n > 1 ? ` (${n} variants)` : ""}. Accept or Reject${warnings.length ? `; check: ${warnings.join("; ")}` : ""}.`,
+    notes: warnings.map((w) => ({ pin: null, status: "question" as const, text: w })),
+    candidate: c,
+  });
+  return { candidate: c, prompt: imagePrompt, workDir: work };
 }

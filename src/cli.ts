@@ -4,8 +4,12 @@
  *   watch                       print "NEW FEEDBACK: <folder>" for every unanswered Send (Claude mode)
  *   pending                     list unanswered Sends
  *   accept|reject <assetId>     same as the page buttons for the current candidate
- *   request <assetId> --note <text> [--rect x0,y0,x1,y1]... [--ellipse x0,y0,x1,y1]...
- *                               file a Send from the command line (agent batch fixes); prints the folder
+ *   request <assetId> --note <text> [--rect x0,y0,x1,y1]... [--ellipse x0,y0,x1,y1]... [--variant <k>]
+ *                               file a Send from the command line (agent batch fixes); prints the folder.
+ *                               --variant k masks cell k of a variant set (redraw that variant only)
+ *   generate <assetId>... [--note <text>]
+ *                               file a Generate request per asset (draw a new image or variant sheet from the
+ *                               brief); answered like a Send: `fix <folder>` (Claude mode) or the server queue (Codex)
  *   fix <folder> [--instruction <text> | --instruction-file <file>] [--agent claude|codex] [--dry-run]
  *                               edit the image for one Send with Codex image generation, masked composite,
  *                               store a candidate version and write reply.json
@@ -18,14 +22,14 @@
  */
 import { existsSync, readFileSync } from "node:fs";
 import { basename, resolve } from "node:path";
-import { loadConfig } from "./config.ts";
+import { gridOf, loadConfig } from "./config.ts";
 import { fixFeedback } from "./fixer.ts";
 import { createLogger, tailLog } from "./log.ts";
 import { startServer } from "./server.ts";
 import { allTags, createTag, deleteTag, editTagAssets, renameTag, tagsOf } from "./tags.ts";
 import { PNG } from "pngjs";
 import { blank, readPng, type Img } from "./png.ts";
-import { allJobs, getMeta, jobLabel, makeCurrent, pendingFeedback, rejectCandidate, versionPath, writeAck, writeFeedback } from "./store.ts";
+import { allJobs, getMeta, jobLabel, makeCurrent, pendingFeedback, rejectCandidate, versionPath, writeAck, writeFeedback, writeGenerateRequest } from "./store.ts";
 
 function toDataUrl(img: Img): string {
   const p = new PNG({ width: img.width, height: img.height });
@@ -145,6 +149,14 @@ async function main() {
     const meta = getMeta(cfg, pos);
     const cur = readPng(versionPath(cfg, pos, meta.current));
     const shapes = process.argv.flatMap((a, i) => (a === "--rect" || a === "--ellipse" ? [{ kind: a.slice(2), box: process.argv[i + 1].split(",").map(Number) }] : []));
+    const variant = arg("variant");
+    if (variant) {
+      // the cell of variant k, inset a little so the neighbours are safe from the mask's grow + feather
+      const [cols, rows] = gridOf(cfg.byId.get(pos)!.variants), k = Number(variant) - 1;
+      if (!(k >= 0 && k < (cfg.byId.get(pos)!.variants ?? 1))) throw new Error(`--variant must be 1..${cfg.byId.get(pos)!.variants ?? 1}`);
+      const cw = cur.width / cols, ch = cur.height / rows, x0 = (k % cols) * cw, y0 = Math.floor(k / cols) * ch, pad = 26;
+      shapes.push({ kind: "rect", box: [x0 + pad, y0 + pad, x0 + cw - pad, y0 + ch - pad] });
+    }
     let mask: string | null = null;
     if (shapes.length) {
       const m = blank(cur.width, cur.height);
@@ -162,6 +174,17 @@ async function main() {
     const dir = writeFeedback(cfg, { asset: pos, pins: [], notes: arg("note") ?? "", sketch: toDataUrl(cur), mask, photos: [] });
     L.scope(pos).info(`${basename(dir)}: Send filed from the CLI (${shapes.length} mask shape(s))`);
     console.log(dir);
+    return;
+  }
+
+  if (cmd === "generate") {
+    const ids = process.argv.slice(3).filter((a, i, all) => !a.startsWith("--") && !(all[i - 1] ?? "").startsWith("--"));
+    if (!ids.length) throw new Error("usage: generate <assetId>... [--note <text>]");
+    for (const id of ids) {
+      const dir = writeGenerateRequest(cfg, id, arg("note") ?? "");
+      L.scope(id).info(`${basename(dir)}: Generate filed from the CLI`);
+      console.log(dir);
+    }
     return;
   }
 

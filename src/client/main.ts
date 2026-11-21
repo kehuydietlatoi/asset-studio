@@ -2,10 +2,23 @@
 
 type Version = { n: number; at: string; source: string; parent?: number; prompt?: string; agent?: string };
 type Meta = { id: string; status: string; current: number; candidate: number | null; versions: Version[] };
-type AssetRow = { id: string; label: string; scale: number; meta: Meta | null; job: string | null };
+type OverlayDef = { on?: string[]; anchor?: [number, number]; size?: number; motion?: "flicker" | "orbit" | "rise" | "none"; count?: number; icon?: boolean };
+type AssetRow = {
+  id: string;
+  label: string;
+  scale: number;
+  brief: string;
+  variants: number;
+  grid: [number, number];
+  size: [number, number];
+  overlay: OverlayDef | null;
+  meta: Meta | null;
+  job: string | null;
+};
+type OverlayCfg = { bases?: string[]; baseHeight?: number; tints?: { label: string; color?: string; alpha?: number }[] };
 type Group = { id: string; label: string; assets: AssetRow[] };
 type Tag = { id: string; label: string; kind: "group" | "config" | "user"; assets: string[] };
-type Project = { name: string; agent: string; stage: { sky?: string; ground?: string; groundY?: number }; groups: Group[]; tags: Tag[] };
+type Project = { name: string; agent: string; stage: { sky?: string; ground?: string; groundY?: number }; overlay: OverlayCfg; groups: Group[]; tags: Tag[] };
 type ReplyNote = { pin: number | null; status: "fixed" | "question" | "wont"; text: string };
 type Feedback = { folder: string; ack: { by: string } | null; reply: { summary: string; notes: ReplyNote[]; candidate?: number } | null; job: string | null };
 
@@ -23,10 +36,11 @@ const $ = <T extends HTMLElement = HTMLElement>(id: string) => document.getEleme
 const stage = $<HTMLCanvasElement>("stage");
 const g = stage.getContext("2d")!;
 const lineup = $<HTMLCanvasElement>("lineup");
+const overlayCv = $<HTMLCanvasElement>("overlay");
 
 let project: Project | null = null;
 let selId: string | null = null;
-let view: "focus" | "lineup" | "board" = "focus";
+let view: "focus" | "lineup" | "board" | "overlay" = "focus";
 let tool: Tool = "mask";
 let viewVersion: number | null = null; // null = current
 let compare = false;
@@ -35,7 +49,9 @@ let lastFeedback: Feedback | null = null;
 const markups = new Map<string, Markup>();
 const images = new Map<string, HTMLImageElement>();
 
-const STATUS_LABEL: Record<string, string> = { generated: "generated", in_review: "in review", needs_fix: "needs fix", approved: "approved" };
+const STATUS_LABEL: Record<string, string> = { brief: "brief", generated: "generated", in_review: "in review", needs_fix: "needs fix", approved: "approved" };
+/** Version to show for an asset: the current one, or the candidate when nothing has been accepted yet (0 = none). */
+const shownV = (a: AssetRow) => (a.meta ? a.meta.current || a.meta.candidate || 0 : 0);
 
 // ------------------------------------------------------------------ data
 
@@ -178,7 +194,7 @@ try {
 function renderList() {
   if (!project) return;
   const row = (a: AssetRow) =>
-    `<div class="asset ${a.id === selId ? "sel" : ""} st-${a.meta?.status ?? "generated"}${isMarked(a.id) ? " is-marked" : ""}${a.job ? " has-job" : ""}" data-id="${a.id}" title="${esc(a.label)} · ${STATUS_LABEL[a.meta?.status ?? "generated"] ?? ""}${a.job ? ` · ${esc(a.job)}` : ""}"><img src="${a.meta ? imgUrl(a.id, a.meta.current) : ""}" alt="" /><span class="lbl">${esc(a.label)}</span>${markedBadge(a.id)}${chip(a)}</div>`;
+    `<div class="asset ${a.id === selId ? "sel" : ""} st-${a.meta?.status ?? "generated"}${isMarked(a.id) ? " is-marked" : ""}${a.job ? " has-job" : ""}" data-id="${a.id}" title="${esc(a.label)} · ${STATUS_LABEL[a.meta?.status ?? "generated"] ?? ""}${a.job ? ` · ${esc(a.job)}` : ""}">${shownV(a) ? `<img src="${imgUrl(a.id, shownV(a))}" alt="" />` : `<span class="noimg" title="No image yet: Generate it">✦</span>`}<span class="lbl">${esc(a.label)}</span>${markedBadge(a.id)}${chip(a)}</div>`;
   const section = (label: string, rows: AssetRow[], kind = "") =>
     `<div class="group"><h3>${kind ? `<span class="tk ${kind}" title="${kind === "user" ? "tag made in the page" : "tag from the config"}"></span>` : ""}${esc(label)} (${rows.length})</h3>${rows.map(row).join("")}</div>`;
   const toggle = `<div class="listMode"><button data-list="group" class="${listMode === "group" ? "on" : ""}">By group</button><button data-list="tag" class="${listMode === "tag" ? "on" : ""}">By tag</button></div>`;
@@ -208,6 +224,7 @@ let batchBusy = false;
 
 const FILTERS: { id: string; label: string; test: (a: AssetRow) => boolean }[] = [
   { id: "all", label: "All", test: () => true },
+  { id: "brief", label: "Brief (no image)", test: (a) => a.meta?.status === "brief" },
   { id: "generated", label: "Not reviewed", test: (a) => (a.meta?.status ?? "generated") === "generated" },
   { id: "needs_fix", label: "Needs fix", test: (a) => a.meta?.status === "needs_fix" },
   { id: "in_review", label: "In review", test: (a) => a.meta?.status === "in_review" },
@@ -272,7 +289,8 @@ function renderBoard() {
   $("bCount").textContent = `${chosen.length} selected`;
   $("bSendMarked").textContent = `Send all marked (${marked.length})`;
   $("bSendNote").textContent = `Send note to selected (${chosen.length})`;
-  for (const id of ["bApprove", "bNeedsFix", "bAccept", "bReject", "bSendNote", "bTagRemove"]) ($(id) as HTMLButtonElement).disabled = batchBusy || !chosen.length;
+  for (const id of ["bApprove", "bNeedsFix", "bAccept", "bReject", "bSendNote", "bTagRemove", "bGenerate"]) ($(id) as HTMLButtonElement).disabled = batchBusy || !chosen.length;
+  $("bGenerate").textContent = `Generate selected (${chosen.length})`;
   addSel.disabled = batchBusy || !chosen.length;
   ($("bAccept") as HTMLButtonElement).disabled ||= !chosen.some((a) => a.meta?.candidate);
   ($("bReject") as HTMLButtonElement).disabled ||= !chosen.some((a) => a.meta?.candidate);
@@ -285,13 +303,13 @@ function renderBoard() {
           (a) =>
             `<div class="card ${picked.has(a.id) ? "picked" : ""} ${a.id === selId ? "sel" : ""}" data-id="${a.id}" title="Click: details on the right · Double-click: open to mark up">` +
             `<input type="checkbox" class="pick" data-pick="${a.id}" ${picked.has(a.id) ? "checked" : ""} title="Select (Shift: range)" />` +
-            `<img src="${a.meta ? imgUrl(a.id, a.meta.candidate ?? a.meta.current) : ""}" alt="" />` +
+            (a.meta && (a.meta.candidate || a.meta.current) ? `<img src="${imgUrl(a.id, a.meta.candidate || a.meta.current)}" alt="" />` : `<div class="noimg" title="${esc(a.brief)}">✦ brief<small>${esc(a.brief.slice(0, 90))}</small></div>`) +
             `<div class="lbl">${esc(a.label)}</div>` +
             (() => {
               const ts = tagsOfAsset(a.id, false);
               return ts.length ? `<div class="tags">${ts.map((t) => `<span class="tag ${t.kind}">${esc(t.label)}</span>`).join("")}</div>` : "";
             })() +
-            `<div class="meta">${chip(a)}${markedBadge(a.id)}<span>${a.meta ? `v${a.meta.candidate ?? a.meta.current}${a.meta.candidate ? " (cand.)" : ""}` : "missing"}</span></div></div>`,
+            `<div class="meta">${chip(a)}${markedBadge(a.id)}<span>${a.meta && (a.meta.candidate || a.meta.current) ? `v${a.meta.candidate ?? a.meta.current}${a.meta.candidate ? " (cand.)" : ""}` : "no image"}${a.variants > 1 ? ` · ${a.variants} var.` : ""}</span></div></div>`,
         )
         .join("")
     : `<div class="empty">No assets match this filter.</div>`;
@@ -349,6 +367,67 @@ async function sendMany(rows: AssetRow[], extraNote: string, what: string) {
   pollFeedback();
 }
 
+/** File Generate requests (brief + optional note). The server caps one click at 10 images. */
+async function generateMany(rows: AssetRow[], note: string) {
+  if (!rows.length) return toast("Select assets first");
+  if (rows.length > 10) return toast(`Generate at most 10 at a time (${rows.length} selected): each takes a few minutes and Codex quota`);
+  const redo = rows.filter((a) => a.meta && a.meta.current > 0).length;
+  const msg =
+    `Generate ${rows.length} image(s) from the brief${note ? ` + note "${note}"` : ""}?` +
+    `\nAbout 2-3 minutes each, one after another, using your Codex quota.` +
+    (redo ? `\n${redo} already have an image: the new one comes as a candidate, the old one stays in the history.` : "");
+  if (!confirm(msg)) return;
+  try {
+    const r = await api<{ results: { id: string; ok: boolean; detail: string }[]; agent: string }>("/generate", { assets: rows.map((a) => a.id), note });
+    const bad = r.results.filter((x) => !x.ok);
+    toast(`${r.results.length - bad.length} Generate request(s) filed${r.agent === "claude" ? " (Claude answers them)" : ""}${bad.length ? `; skipped: ${bad.map((b) => b.detail).join(" · ")}` : ""}`);
+  } catch (e) {
+    toast((e as Error).message);
+  }
+  lastReplyKey = "";
+  await refreshProject();
+  pollFeedback();
+}
+
+/** Redraw one variant of a set: a Send whose mask is that cell only (the other variants cannot change). */
+async function redoVariant(a: AssetRow, k: number) {
+  if (!a.meta?.current) return toast("Accept a generated sheet first");
+  const note = prompt(`Redraw variant ${k} only. What should change? (empty = just a different variant)`, "");
+  if (note === null) return;
+  try {
+    const im = await whenLoaded(loadImage(imgUrl(a.id, a.meta.current)));
+    const W = im.naturalWidth, H = im.naturalHeight, [cols, rows] = a.grid;
+    const cw = W / cols, ch = H / rows, x0 = ((k - 1) % cols) * cw, y0 = Math.floor((k - 1) / cols) * ch, pad = 26 * (W / 1024);
+    const mk = (fill: (c: CanvasRenderingContext2D) => void) => {
+      const c = document.createElement("canvas");
+      c.width = W;
+      c.height = H;
+      fill(c.getContext("2d")!);
+      return c.toDataURL("image/png");
+    };
+    const mask = mk((c) => {
+      c.fillStyle = "#000";
+      c.fillRect(0, 0, W, H);
+      c.fillStyle = "#fff";
+      c.fillRect(x0 + pad, y0 + pad, cw - 2 * pad, ch - 2 * pad);
+    });
+    const sketch = mk((c) => {
+      c.drawImage(im, 0, 0);
+      c.strokeStyle = "#ff2a2a";
+      c.lineWidth = Math.max(3, W / 300);
+      c.strokeRect(x0 + pad, y0 + pad, cw - 2 * pad, ch - 2 * pad);
+    });
+    const text = `Redraw variant ${k} only (the cell inside the red box): a new variant of the same subject${a.brief ? ` (${a.brief})` : ""}, same size, style, palette and line weight as the other variants, centred with a margin.${note.trim() ? ` ${note.trim()}` : ""}`;
+    const r = await api<{ folder: string }>("/send", { asset: a.id, pins: [], notes: text, sketch, mask, photos: [] });
+    toast(`Variant ${k} sent (${r.folder})`);
+    lastReplyKey = "";
+    await refreshProject();
+    pollFeedback();
+  } catch (e) {
+    toast((e as Error).message);
+  }
+}
+
 /** Select an asset; `open` switches to Focus (list clicks do, a single click on a Board card does not). */
 function select(id: string, open = true) {
   selId = id;
@@ -399,7 +478,21 @@ function renderPanel() {
   const meta = a?.meta;
   const cand = meta?.candidate ?? null;
   $("candidate").classList.toggle("hidden", !cand);
-  if (cand) $("candTitle").textContent = `Candidate v${cand} (current v${meta!.current}). Tick "Compare" to slide between them.`;
+  if (cand)
+    $("candTitle").textContent = meta!.current
+      ? `Candidate v${cand} (current v${meta!.current}). Tick "Compare" to slide between them.`
+      : `Generated v${cand}: nothing accepted yet. Accept writes the game file${a!.variants > 1 ? ` and the ${a!.variants} variant files` : ""}.`;
+  // Generate box: every asset with a brief (or none yet: the Note becomes the brief for this run)
+  $("genBox").classList.toggle("hidden", !a);
+  if (a) {
+    $("briefText").textContent = a.brief || "No brief in the config: write what to draw in the Note below.";
+    $("genInfo").textContent = `${a.size[0]}×${a.size[1]}${a.variants > 1 ? ` · ${a.variants} variants on a ${a.grid[0]}×${a.grid[1]} grid` : ""} · uses the brief + your Note`;
+    ($("generate") as HTMLButtonElement).textContent = meta?.current || cand ? "Generate again" : "Generate";
+    $("variantRow").innerHTML =
+      a.variants > 1 && meta?.current
+        ? `<span>Redo one variant:</span>` + Array.from({ length: a.variants }, (_, k) => `<button data-redo="${k + 1}" title="Masked edit of cell ${k + 1} only">${k + 1}</button>`).join("")
+        : "";
+  }
   $("versions").innerHTML = (meta?.versions ?? [])
     .slice()
     .reverse()
@@ -453,7 +546,39 @@ async function pollFeedback() {
 function currentImage(): HTMLImageElement | null {
   const a = sel();
   if (!a?.meta) return null;
-  return loadImage(imgUrl(a.id, viewVersion ?? a.meta.current));
+  const v = viewVersion ?? shownV(a);
+  return v ? loadImage(imgUrl(a.id, v)) : null;
+}
+
+/** Dashed cell borders and numbers over a variant sheet (on screen only, never sent). */
+function drawGrid(ctx: CanvasRenderingContext2D, a: AssetRow, W: number, H: number) {
+  if (a.variants <= 1) return;
+  const [cols, rows] = a.grid, cw = W / cols, ch = H / rows;
+  ctx.save();
+  ctx.strokeStyle = "#00000055";
+  ctx.setLineDash([W / 80, W / 120]);
+  ctx.lineWidth = Math.max(2, W / 500);
+  for (let c = 1; c < cols; c++) {
+    ctx.beginPath();
+    ctx.moveTo(c * cw, 0);
+    ctx.lineTo(c * cw, H);
+    ctx.stroke();
+  }
+  for (let r = 1; r < rows; r++) {
+    ctx.beginPath();
+    ctx.moveTo(0, r * ch);
+    ctx.lineTo(W, r * ch);
+    ctx.stroke();
+  }
+  ctx.setLineDash([]);
+  ctx.font = `bold ${Math.round(W / 40)}px system-ui`;
+  ctx.textBaseline = "top";
+  for (let k = 0; k < cols * rows; k++) {
+    const x = (k % cols) * cw + 10, y = Math.floor(k / cols) * ch + 8;
+    ctx.fillStyle = k < a.variants ? "#00000088" : "#00000033";
+    ctx.fillText(k < a.variants ? String(k + 1) : "empty", x, y);
+  }
+  ctx.restore();
 }
 
 function drawMarkup(ctx: CanvasRenderingContext2D, W: number, H: number, m = markup()) {
@@ -525,6 +650,22 @@ function strokePath(ctx: CanvasRenderingContext2D, s: { w: number; pts: Pt[]; ki
 
 function renderFocus() {
   const im = currentImage();
+  const a0 = sel();
+  if (a0?.meta && !shownV(a0)) {
+    // brief only: say so on the stage instead of a blank canvas
+    stage.width = 1024;
+    stage.height = 576;
+    fitStage();
+    g.clearRect(0, 0, 1024, 576);
+    g.fillStyle = "#8a7f72";
+    g.font = "bold 30px system-ui";
+    g.textAlign = "center";
+    g.fillText(a0.job ? "Generating…" : "No image yet", 512, 250);
+    g.font = "18px system-ui";
+    g.fillText(a0.job ? a0.job.slice(0, 80) : "Press Generate on the right: it draws from the brief.", 512, 295);
+    g.textAlign = "start";
+    return;
+  }
   if (!im || !im.complete || !im.naturalWidth) {
     g.clearRect(0, 0, stage.width, stage.height);
     return;
@@ -538,7 +679,7 @@ function renderFocus() {
   g.clearRect(0, 0, W, H);
   const a = sel()!;
   const cand = a.meta?.candidate;
-  if (compare && cand) {
+  if (compare && cand && a.meta!.current) {
     const after = loadImage(imgUrl(a.id, cand));
     const before = loadImage(imgUrl(a.id, a.meta!.current));
     const x = Math.round(W * slider);
@@ -562,6 +703,7 @@ function renderFocus() {
   } else {
     g.drawImage(im, 0, 0);
   }
+  drawGrid(g, a, W, H);
   drawMarkup(g, W, H);
 }
 
@@ -600,9 +742,142 @@ function renderLineup() {
   });
 }
 
+// ------------------------------------------------------------------ overlay view: effects on real sprites at game size
+
+const tintCache = new Map<string, HTMLCanvasElement>();
+/** The sprite with `color` mixed over its opaque pixels (cached per image, colour and alpha). */
+function tinted(im: HTMLImageElement, color?: string, alpha = 0.35): CanvasImageSource {
+  if (!color) return im;
+  const key = `${im.src}|${color}|${alpha}`;
+  let c = tintCache.get(key);
+  if (!c) {
+    c = document.createElement("canvas");
+    c.width = im.naturalWidth;
+    c.height = im.naturalHeight;
+    const x = c.getContext("2d")!;
+    x.drawImage(im, 0, 0);
+    x.globalCompositeOperation = "source-atop";
+    x.globalAlpha = alpha;
+    x.fillStyle = color;
+    x.fillRect(0, 0, c.width, c.height);
+    tintCache.set(key, c);
+  }
+  return c;
+}
+
+/** Draw the selected asset's pieces on a base sprite box (x, y = top-left, h = box size). */
+function drawPieces(ctx: CanvasRenderingContext2D, a: AssetRow, sheet: HTMLImageElement, x: number, y: number, h: number, t: number, seed: number) {
+  const o = a.overlay ?? {};
+  const [cols, rows] = a.grid, n = a.variants;
+  const cw = sheet.naturalWidth / cols, ch = sheet.naturalHeight / rows;
+  const motion = o.motion ?? "flicker", count = o.count ?? (motion === "orbit" || motion === "rise" ? 3 : 1);
+  const [ax, ay] = o.anchor ?? [0.5, 0.45];
+  const ph = (o.icon ? 0.2 : (o.size ?? 0.45)) * h, pw = ph * (cw / ch);
+  const piece = (k: number, cx: number, cy: number, sx = 1, sy = 1, alpha = 1) => {
+    const i = ((k % n) + n) % n;
+    ctx.save();
+    ctx.globalAlpha = alpha;
+    ctx.translate(cx, cy);
+    ctx.scale(sx, sy);
+    ctx.drawImage(sheet, (i % cols) * cw, Math.floor(i / cols) * ch, cw, ch, -pw / 2, -ph / 2, pw, ph);
+    ctx.restore();
+  };
+  if (o.icon) {
+    // health bar over the head, the icon to its right
+    const bw = h * 0.42, bh = Math.max(4, h * 0.045), bx = x + h / 2 - bw / 2, by = y + h * 0.04;
+    ctx.fillStyle = "#1d1a17";
+    ctx.fillRect(bx - 1, by - 1, bw + 2, bh + 2);
+    ctx.fillStyle = "#4caf50";
+    ctx.fillRect(bx, by, bw * 0.7, bh);
+    piece(0, bx + bw + ph * 0.6, by + bh / 2);
+    return;
+  }
+  const cx = x + ax * h, cy = y + ay * h;
+  if (motion === "flicker") {
+    const k = Math.floor(t * 8 + seed * 3);
+    piece(k, cx, cy, 1 + 0.05 * Math.sin(t * 11 + seed), 1 + 0.09 * Math.sin(t * 13 + seed * 2));
+  } else if (motion === "orbit") {
+    for (let i = 0; i < count; i++) {
+      const ang = t * 2.4 + (i * Math.PI * 2) / count;
+      piece(i, cx + Math.cos(ang) * h * 0.22, cy + Math.sin(ang) * h * 0.06, 1, 1, Math.sin(ang) < 0 ? 0.75 : 1);
+    }
+  } else if (motion === "rise") {
+    for (let i = 0; i < count; i++) {
+      const p = (t * 0.7 + i / count + seed * 0.13) % 1;
+      piece(i, cx + Math.sin(p * 6 + i) * h * 0.08, cy - p * h * 0.5, 1 - p * 0.4, 1 - p * 0.4, 1 - p);
+    }
+  } else piece(0, cx, cy);
+}
+
+let overlayRaf = 0;
+function renderOverlay() {
+  cancelAnimationFrame(overlayRaf);
+  if (view !== "overlay" || !project) return;
+  const ctx = overlayCv.getContext("2d")!;
+  const W = overlayCv.width, H = overlayCv.height, a = sel();
+  const st = project.stage, oc = project.overlay ?? {};
+  const gy = Math.round(H * (st.groundY ?? 0.82));
+  ctx.fillStyle = st.sky ?? "#e6d6b0";
+  ctx.fillRect(0, 0, W, H);
+  ctx.fillStyle = st.ground ?? "#8c7350";
+  ctx.fillRect(0, gy, W, H - gy);
+  ctx.fillStyle = "#1d1a17";
+  ctx.font = "16px system-ui";
+  const say = (s: string) => {
+    ctx.fillStyle = "#1d1a17";
+    ctx.font = "bold 22px system-ui";
+    ctx.fillText(s, 30, 50);
+  };
+  if (!a) return say("Pick an asset");
+  const v = a.meta?.candidate || a.meta?.current || 0;
+  if (!v) return say(`"${a.label}" has no image yet: Generate it first.`);
+  const sheet = loadImage(imgUrl(a.id, v));
+  const byId = new Map(allAssets().map((x) => [x.id, x]));
+  const bases = (a.overlay?.on ?? oc.bases ?? []).map((id) => byId.get(id)).filter((x): x is AssetRow => !!x && !!shownV(x));
+  if (!bases.length) return say('No base sprites: set overlay.bases in the config (or overlay.on on this asset).');
+  const tints = oc.tints?.length ? oc.tints : [{ label: "Plain" }];
+  const t = performance.now() / 1000;
+  const drawBase = (b: AssetRow, tint: (typeof tints)[number], x: number, y: number, h: number, seed: number) => {
+    const im = loadImage(imgUrl(b.id, shownV(b)));
+    if (im.complete && im.naturalWidth) ctx.drawImage(tinted(im, tint.color, tint.alpha), x, y, h, h);
+    if (sheet.complete && sheet.naturalWidth) drawPieces(ctx, a, sheet, x, y, h, t, seed);
+  };
+  // top: zoomed, the first base in every look
+  const zh = Math.min(330, (W - 60) / tints.length - 20);
+  tints.forEach((tint, i) => {
+    const x = 30 + i * (zh + 30);
+    drawBase(bases[0], tint, x, gy - zh * 0.977 - (H - gy) * 0 - 150, zh, i);
+    ctx.fillStyle = "#1d1a17";
+    ctx.font = "15px system-ui";
+    ctx.fillText(`${tint.label} · zoom`, x, gy - zh * 0.977 - 158);
+  });
+  // bottom: every base at game size, in every look
+  const bh = oc.baseHeight ?? 120;
+  let x = 30;
+  for (const [i, tint] of tints.entries())
+    for (const [j, b] of bases.entries()) {
+      drawBase(b, tint, x, gy - bh * 0.977, bh, i * 7 + j);
+      ctx.fillStyle = "#1d1a17";
+      ctx.font = "12px system-ui";
+      ctx.fillText(`${tint.label} · ${b.label}`.slice(0, 26), x, gy + 18);
+      x += bh + 24;
+      if (x > W - bh) break;
+    }
+  ctx.fillStyle = "#1d1a17";
+  ctx.font = "14px system-ui";
+  const o = a.overlay ?? {};
+  ctx.fillText(
+    `${a.label} · v${v}${a.meta?.candidate ? " (candidate)" : ""} · motion ${o.motion ?? "flicker"} · anchor [${(o.anchor ?? [0.5, 0.45]).join(", ")}] · size ${o.icon ? "icon" : (o.size ?? 0.45)} · game size ${bh}px (set in the config: overlay)`,
+    30,
+    H - 14,
+  );
+  overlayRaf = requestAnimationFrame(renderOverlay);
+}
+
 function render() {
   if (view === "focus") renderFocus();
   else if (view === "lineup") renderLineup();
+  else if (view === "overlay") renderOverlay();
 }
 
 function setView(v: typeof view) {
@@ -611,6 +886,7 @@ function setView(v: typeof view) {
   $("stageWrap").classList.toggle("hidden", v !== "focus");
   $("toolbar").classList.toggle("hidden", v !== "focus");
   $("lineupWrap").classList.toggle("hidden", v !== "lineup");
+  $("overlayWrap").classList.toggle("hidden", v !== "overlay");
   $("board").classList.toggle("hidden", v !== "board");
   $("boardBar").classList.toggle("hidden", v !== "board");
   if (v === "board") renderBoard();
@@ -708,7 +984,7 @@ async function sendAsset(a: AssetRow, m: Markup, extraNote = ""): Promise<string
   if (pins.some((p) => !p.text.trim())) throw new Error("every pin needs a text");
   const notes = [m.notes.trim(), extraNote.trim()].filter(Boolean).join("\n");
   if (!pins.length && !notes) throw new Error("add a pin or a note first");
-  if (!a.meta) throw new Error("the asset file is missing");
+  if (!a.meta?.current) throw new Error("this asset has no image yet: Generate it first");
   const { sketch, mask } = await exportFor(a, m);
   const r = await api<{ folder: string; agent: string }>("/send", {
     asset: a.id,
@@ -796,6 +1072,7 @@ document.addEventListener("click", async (e) => {
   if (t.id === "bNeedsFix") return runBatch("needs_fix");
   if (t.id === "bAccept") return runBatch("accept");
   if (t.id === "bReject") return runBatch("reject");
+  if (t.id === "bGenerate") return generateMany(pickedRows(), ($("bNote") as HTMLInputElement).value.trim());
   if (t.id === "bSendMarked") return sendMany(boardPool().filter((a) => isMarked(a.id)), "", "their own mark-up");
   if (t.id === "bSendNote") {
     const note = ($("bNote") as HTMLInputElement).value.trim();
@@ -827,6 +1104,8 @@ document.addEventListener("click", async (e) => {
   }
   const a = sel();
   if (!a) return;
+  if (t.id === "generate") return generateMany([a], markup().notes.trim());
+  if (t.dataset.redo) return redoVariant(a, Number(t.dataset.redo));
   try {
     if (t.dataset.revert) {
       await api("/revert", { asset: a.id, v: Number(t.dataset.revert) });

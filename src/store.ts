@@ -6,17 +6,18 @@
  * <dir> is the asset id with "/" replaced by "__".
  */
 import { copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
-import type { LoadedConfig } from "./config.ts";
+import { dirname, join } from "node:path";
+import { cellSize, gridOf, type AssetDef, type LoadedConfig } from "./config.ts";
 import { fmtDuration } from "./log.ts";
-import { readPng } from "./png.ts";
+import { crop, readPng, writePng, type Img } from "./png.ts";
 
-export type ReviewStatus = "generated" | "in_review" | "needs_fix" | "approved";
+/** `brief`: the asset has a brief but no image yet (Generate makes the first one). */
+export type ReviewStatus = "brief" | "generated" | "in_review" | "needs_fix" | "approved";
 
 export interface VersionInfo {
   n: number;
   at: string;
-  source: "import" | "fix" | "manual";
+  source: "import" | "fix" | "manual" | "generate";
   parent?: number;
   prompt?: string;
   feedback?: string;
@@ -26,6 +27,7 @@ export interface VersionInfo {
 export interface Meta {
   id: string;
   status: ReviewStatus;
+  /** 0 = no image yet (status `brief`). */
   current: number;
   candidate: number | null;
   versions: VersionInfo[];
@@ -45,6 +47,8 @@ export interface Notes {
   pins: Pin[];
   notes: string;
   hasMask: boolean;
+  /** `generate`: draw a new image from the brief (no before.png); default `edit`: change the current image. */
+  mode?: "edit" | "generate";
 }
 
 export interface Reply {
@@ -68,21 +72,48 @@ export function versionPath(cfg: LoadedConfig, id: string, n: number): string {
   return join(assetDir(cfg, id), `v${n}.png`);
 }
 
-/** Meta of an asset; the first call imports the configured file as v1. */
+/**
+ * Meta of an asset; the first call imports the configured file as v1. An asset whose file does not exist yet gets
+ * status `brief` and no version: Generate draws its first image. If the file appears later (made outside the
+ * studio), the next call imports it.
+ */
 export function getMeta(cfg: LoadedConfig, id: string): Meta {
   const a = cfg.byId.get(id);
   if (!a) throw new StoreError(`unknown asset ${id}`);
   const dir = assetDir(cfg, id);
   const metaPath = join(dir, "meta.json");
   const meta = readJson<Meta>(metaPath);
-  if (meta) return meta;
   const src = cfg.abs(a.file);
-  if (!existsSync(src)) throw new StoreError(`asset file missing: ${a.file}`);
+  if (meta && !(meta.current === 0 && !meta.versions.length && existsSync(src))) return meta;
   mkdirSync(dir, { recursive: true });
+  if (!existsSync(src)) {
+    const brief: Meta = { id, status: "brief", current: 0, candidate: null, versions: [] };
+    writeJson(metaPath, brief);
+    return brief;
+  }
   copyFileSync(src, join(dir, "v1.png"));
   const fresh: Meta = { id, status: "generated", current: 1, candidate: null, versions: [{ n: 1, at: now(), source: "import" }] };
   writeJson(metaPath, fresh);
   return fresh;
+}
+
+/** Pixel size of the image Generate makes for an asset (the whole sheet for a variant set). */
+export function sheetSize(a: Pick<AssetDef, "variants" | "size">): [number, number] {
+  const [cw, ch] = cellSize(a), [cols, rows] = gridOf(a.variants);
+  return [cw * cols, ch * rows];
+}
+
+/** The variants of a sheet, left to right, top to bottom (cell size = sheet size / grid). */
+export function splitVariants(sheet: Img, variants: number): Img[] {
+  const [cols, rows] = gridOf(variants);
+  const cw = Math.floor(sheet.width / cols), ch = Math.floor(sheet.height / rows);
+  return Array.from({ length: variants }, (_, k) => crop(sheet, (k % cols) * cw, Math.floor(k / cols) * ch, cw, ch));
+}
+
+/** Game files of the variants of a set: `burn_flame.png` -> `burn_flame.1.png`, `burn_flame.2.png`, ... */
+export function variantFiles(a: Pick<AssetDef, "file" | "variants">): string[] {
+  const stem = a.file.replace(/\.png$/i, "");
+  return Array.from({ length: a.variants ?? 1 }, (_, k) => `${stem}.${k + 1}.png`);
 }
 
 function saveMeta(cfg: LoadedConfig, meta: Meta): void {
@@ -92,7 +123,7 @@ function saveMeta(cfg: LoadedConfig, meta: Meta): void {
 /** Store a new version as the candidate (shown as "after" until accepted or rejected). Returns its number. */
 export function addCandidate(cfg: LoadedConfig, id: string, pngPath: string, info: Omit<VersionInfo, "n" | "at">): number {
   const meta = getMeta(cfg, id);
-  const n = Math.max(...meta.versions.map((v) => v.n)) + 1;
+  const n = Math.max(0, ...meta.versions.map((v) => v.n)) + 1;
   copyFileSync(pngPath, versionPath(cfg, id, n));
   meta.versions.push({ n, at: now(), ...info });
   meta.candidate = n;
@@ -101,11 +132,17 @@ export function addCandidate(cfg: LoadedConfig, id: string, pngPath: string, inf
   return n;
 }
 
-/** Make version n current and write it to the game's asset file. */
+/** Make version n current and write it to the game's asset file (and, for a variant set, each variant's file). */
 export function makeCurrent(cfg: LoadedConfig, id: string, n: number): Meta {
   const meta = getMeta(cfg, id);
   if (!meta.versions.some((v) => v.n === n)) throw new StoreError(`no version ${n}`);
-  copyFileSync(versionPath(cfg, id, n), cfg.abs(cfg.byId.get(id)!.file));
+  const a = cfg.byId.get(id)!;
+  mkdirSync(dirname(cfg.abs(a.file)), { recursive: true });
+  copyFileSync(versionPath(cfg, id, n), cfg.abs(a.file));
+  if ((a.variants ?? 1) > 1) {
+    const parts = splitVariants(readPng(versionPath(cfg, id, n)), a.variants!);
+    variantFiles(a).forEach((f, k) => writePng(cfg.abs(f), parts[k]));
+  }
   meta.current = n;
   if (meta.candidate === n) meta.candidate = null;
   saveMeta(cfg, meta);
@@ -115,6 +152,7 @@ export function makeCurrent(cfg: LoadedConfig, id: string, n: number): Meta {
 export function rejectCandidate(cfg: LoadedConfig, id: string): Meta {
   const meta = getMeta(cfg, id);
   meta.candidate = null;
+  if (meta.current === 0) meta.status = "brief"; // still nothing accepted
   saveMeta(cfg, meta);
   return meta;
 }
@@ -159,6 +197,7 @@ export function writeFeedback(cfg: LoadedConfig, p: SendPayload): string {
   if (p.photos.length > MAX_PHOTOS) throw new StoreError(`at most ${MAX_PHOTOS} photos`);
   if (!p.pins.length && !p.notes?.trim()) throw new StoreError("add at least one pin or a note");
   const meta = getMeta(cfg, p.asset);
+  if (meta.current === 0) throw new StoreError("this asset has no image yet: Generate it first");
   const stamp = new Date().toISOString().replace(/[-:]/g, "").replace("T", "-").slice(0, 15);
   let dir = join(feedbackRoot(cfg), dirOf(p.asset), stamp);
   for (let i = 2; existsSync(dir); i++) dir = join(feedbackRoot(cfg), dirOf(p.asset), `${stamp}-${i}`);
@@ -173,6 +212,26 @@ export function writeFeedback(cfg: LoadedConfig, p: SendPayload): string {
   writeJson(join(dir, "notes.json"), notes);
   writeJson(join(dir, "status.json"), { complete: true, at: now() });
   setStatus(cfg, p.asset, "needs_fix");
+  return dir;
+}
+
+/**
+ * File a Generate request for one asset: a Send folder with `mode: "generate"` and no before.png. It goes through
+ * the same queue, watcher, job tracking and reply as an edit; the fixer draws a new image from the brief (plus the
+ * optional note) and stores it as a candidate.
+ */
+export function writeGenerateRequest(cfg: LoadedConfig, id: string, note = ""): string {
+  const a = cfg.byId.get(id);
+  if (!a) throw new StoreError("unknown asset");
+  if (!a.brief?.trim() && !note.trim()) throw new StoreError(`${id} has no brief: add one in the config or write a note`);
+  const meta = getMeta(cfg, id);
+  const stamp = new Date().toISOString().replace(/[-:]/g, "").replace("T", "-").slice(0, 15);
+  let dir = join(feedbackRoot(cfg), dirOf(id), stamp);
+  for (let i = 2; existsSync(dir); i++) dir = join(feedbackRoot(cfg), dirOf(id), `${stamp}-${i}`);
+  mkdirSync(dir, { recursive: true });
+  const notes: Notes = { asset: id, version: meta.current, imageSize: sheetSize(a), pins: [], notes: String(note).slice(0, 2000), hasMask: false, mode: "generate" };
+  writeJson(join(dir, "notes.json"), notes);
+  writeJson(join(dir, "status.json"), { complete: true, at: now() });
   return dir;
 }
 

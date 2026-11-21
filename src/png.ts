@@ -144,6 +144,43 @@ export function composite(base: Img, top: Img, mask: Float32Array): Img {
   return out;
 }
 
+/** Copy of the rectangle (x, y, w, h); parts outside the image stay transparent. */
+export function crop(src: Img, x: number, y: number, w: number, h: number): Img {
+  const out = blank(w, h);
+  for (let yy = 0; yy < h; yy++) {
+    const sy = y + yy;
+    if (sy < 0 || sy >= src.height) continue;
+    for (let xx = 0; xx < w; xx++) {
+      const sx = x + xx;
+      if (sx < 0 || sx >= src.width) continue;
+      src.data.copy(out.data, (yy * w + xx) * 4, (sy * src.width + sx) * 4, (sy * src.width + sx) * 4 + 4);
+    }
+  }
+  return out;
+}
+
+/** True when visible pixels (alpha > 32) lie within `margin` px of the image edge: the piece may be cut off. */
+export function touchesEdge(img: Img, margin = 2): boolean {
+  const { width: w, height: h, data } = img;
+  for (let y = 0; y < h; y++) {
+    const edgeRow = y < margin || y >= h - margin;
+    for (let x = 0; x < w; x++) {
+      if (!edgeRow && x >= margin && x < w - margin) {
+        x = w - margin - 1; // skip the inside of the row
+        continue;
+      }
+      if (data[(y * w + x) * 4 + 3] > 32) return true;
+    }
+  }
+  return false;
+}
+
+/** True when the image has no visible pixel at all (an empty variant cell). */
+export function isEmpty(img: Img): boolean {
+  for (let i = 3; i < img.data.length; i += 4) if (img.data[i] > 32) return false;
+  return true;
+}
+
 /** Fraction of mask pixels that are set (> 0.5). */
 export function maskCoverage(mask: Float32Array): number {
   let n = 0;

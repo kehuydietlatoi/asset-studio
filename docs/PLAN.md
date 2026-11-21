@@ -63,6 +63,12 @@ M3 (2026-11-21): board filters with counts, multi-select (Shift range), batch Ap
 "Send all marked", "Send note to selected", server-side drafts. Also a fix timeout and studio log
 (`fixTimeoutMin`, `.asset-studio/logs/studio.log`). Still open in M3: the real HOV 2★/3★ audit run through the board.
 
+Generate + variant sets + overlay (2026-11-22, for HOV status effects): assets with a brief but no file
+(status `brief`), Generate one or up to 10 from the Board, variant sheets (2×2 / 3×2) split into per-variant files on
+Accept with empty / cut-off checks, Redo one variant (masked cell edit), per-asset `styleBlock` / `refs`, and an
+Overlay view (effects on real sprites at game size, ally + enemy tint, flicker / orbit / rise / icon). This covers
+what M4's `sheet` stage was for when the game animates pieces itself; frame-by-frame mark-up stays open.
+
 ## 6. M5: tags and saved rules (user feedback, 2026-11-21)
 
 ### The request (HOV user, translated)

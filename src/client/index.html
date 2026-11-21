@@ -14,6 +14,7 @@
         <button data-view="focus" class="on">Focus</button>
         <button data-view="lineup">Line-up</button>
         <button data-view="board">Board</button>
+        <button data-view="overlay" title="The selected effect or icon on real sprites at game size, as ally and enemy">Overlay</button>
       </nav>
       <span id="toast"></span>
       <a id="logLink" href="/api/log?n=500" target="_blank" rel="noopener" title="Studio log: every Send, fix stage, Codex run and error">Log</a>
@@ -59,12 +60,14 @@
           <div class="bRow">
             <input id="bNote" placeholder="Note for every selected asset, e.g. &quot;outline too thin, match the 1★ form&quot;" />
             <button id="bSendNote" title="Each selected asset gets a Send: its own mark-up (if any) plus this note">Send note to selected</button>
+            <button id="bGenerate" title="Draw each selected asset from its brief (plus the note). At most 10 at a time.">Generate selected</button>
             <button id="bSendMarked" class="primary" title="Send every asset on the board that has mark-up not sent yet">Send all marked</button>
           </div>
           <div id="bProgress"></div>
         </div>
         <div id="stageWrap"><canvas id="stage"></canvas></div>
         <div id="lineupWrap" class="hidden"><canvas id="lineup" width="1600" height="640"></canvas></div>
+        <div id="overlayWrap" class="hidden"><canvas id="overlay" width="1600" height="640"></canvas></div>
         <div id="board" class="hidden"></div>
       </section>
       <aside id="panel">
@@ -75,6 +78,12 @@
           <button id="needsFix">Needs fix</button>
         </div>
         <div id="assetTags"></div>
+        <div id="genBox" class="hidden">
+          <h3>Brief</h3>
+          <p id="briefText"></p>
+          <div class="row"><button id="generate" class="primary">Generate</button><small id="genInfo"></small></div>
+          <div id="variantRow"></div>
+        </div>
         <h3>Pins</h3>
         <ol id="pins"></ol>
         <h3>Note</h3>

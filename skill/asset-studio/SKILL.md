@@ -19,23 +19,32 @@ game repo root (the folder with `asset-studio.config.mjs`).
    A Board batch ("Send all marked", "Send note to selected") arrives as several `NEW FEEDBACK` lines, one folder per
    asset: answer them one at a time, oldest first, each with its own `fix`. Notes from "Send note to selected" are
    the same text on every asset; still read each sketch, the right edit differs per image.
-3. **Read the Send** in `<folder>`: `notes.json` (pins with text, general note), `sketch.png` (what the owner saw with
+3. **Generate requests.** If `notes.json` has `"mode": "generate"`, there is no image to edit: the asset is drawn
+   new from its brief (`brief` in the config) plus the owner's note. Run
+   `node <studio>/bin/asset-studio.mjs fix "<folder>" --agent claude` (add `--instruction "<text>"` only to sharpen
+   the note; the brief, style block and variant-grid rules stay). Then check `work/edit-raw.png`: for a variant
+   set (`variants` > 1) every cell must hold one complete, separate variant of the same subject. The reply lists
+   empty or cut-off variants; if the sheet is unusable, run `fix` again. Skip steps 4-5 below.
+   Mass generation: `asset-studio generate <id>... [--note <text>]` files one request per asset (at most 10 at a
+   time is a good batch: 2-3 min each). To redraw one variant only:
+   `asset-studio request <id> --variant <k> --note "<what to change>"`, then `fix` that folder as an edit.
+4. **Read the Send** in `<folder>`: `notes.json` (pins with text, general note), `sketch.png` (what the owner saw with
    their mark-up: look at it), `mask.png` (white = may change), `photos/`, `before.png`.
-4. **Write the instruction.** One short paragraph per pin: what to remove, what to put there, what must stay. Use the
+5. **Write the instruction.** One short paragraph per pin: what to remove, what to put there, what must stay. Use the
    asset's role and the game's rules (style block, banned motifs). If a pin is ambiguous or the mask clearly misses the
    thing the pin talks about, do not edit: write `reply.json` with `"status": "question"` and ask.
-5. **Fix.** `node <studio>/bin/asset-studio.mjs fix "<folder>" --agent claude --instruction "<text>"`
+6. **Fix.** `node <studio>/bin/asset-studio.mjs fix "<folder>" --agent claude --instruction "<text>"`
    (or `--instruction-file`). It runs Codex image generation, composites the result back only inside the mask,
    stores a candidate version and writes `reply.json`. Takes 1-3 minutes.
-6. **Check before the owner does.** Read `<folder>/work/edit-raw.png` and the candidate
+7. **Check before the owner does.** Read `<folder>/work/edit-raw.png` and the candidate
    (`.asset-studio/assets/<id with / as __>/v<n>.png`). If the edit ignored the instruction or broke the style, run
    `fix` again with a sharper instruction (it makes a new candidate). If parts of the old object survive at the mask
    edge, reply asking the owner to paint the mask wider.
    If `fix` fails or times out (`fixTimeoutMin`, default 10 min), read the error, then `asset-studio log -n 40` and
    `<folder>/work/codex.log`. Retry once if it looks transient; otherwise write `reply.json` with `"status": "wont"`
    and the reason, so the page stops showing the job as running.
-7. **Reply in one terminal line** too: what changed, which version to compare.
-8. Accepting writes the game file (`file` in the config). Commit game assets only when the owner asks.
+8. **Reply in one terminal line** too: what changed, which version to compare.
+9. Accepting writes the game file (`file` in the config). Commit game assets only when the owner asks.
 
-Codex mode (`agent: "codex"` in the config): the server runs step 5 by itself with the pins' text as the
-instruction; no watcher or Claude needed.
+Codex mode (`agent: "codex"` in the config): the server runs step 6 (and Generate requests) by itself with the
+pins' text or the brief as the instruction; no watcher or Claude needed.

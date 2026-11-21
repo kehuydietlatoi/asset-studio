@@ -4,7 +4,7 @@ import type { IncomingMessage, ServerResponse } from "node:http";
 import { basename, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { createServer, type Plugin } from "vite";
-import type { LoadedConfig } from "./config.ts";
+import { gridOf, type LoadedConfig } from "./config.ts";
 import { fixFeedback } from "./fixer.ts";
 import { createLogger, tailLog, type Logger } from "./log.ts";
 import { allTags, createTag, deleteTag, editTagAssets, renameTag } from "./tags.ts";
@@ -21,8 +21,10 @@ import {
   readJob,
   rejectCandidate,
   setStatus,
+  sheetSize,
   StoreError,
   versionPath,
+  writeGenerateRequest,
   writeDraft,
   writeFeedback,
   writeJob,
@@ -35,6 +37,8 @@ import {
 const CLIENT = join(dirname(fileURLToPath(import.meta.url)), "client");
 const MAX_BODY = 60 * 1024 * 1024;
 const STATUSES: ReviewStatus[] = ["generated", "in_review", "needs_fix", "approved"];
+/** One click of "Generate selected" may queue at most this many images (each takes minutes and quota). */
+const MAX_GENERATE = 10;
 
 /**
  * Codex mode: Sends are fixed one at a time, in order. A job that hangs is killed by the fixer's timeout
@@ -95,6 +99,7 @@ function api(cfg: LoadedConfig, L: Logger): Plugin {
     name: cfg.name,
     agent: cfg.agent,
     stage: cfg.stage ?? {},
+    overlay: cfg.overlay ?? {},
     tags: allTags(cfg),
     groups: cfg.groups.map((g) => ({
       id: g.id,
@@ -107,7 +112,18 @@ function api(cfg: LoadedConfig, L: Logger): Plugin {
           if (!(e instanceof StoreError)) throw e;
         }
         const f = latestFeedback(cfg, a.id);
-        return { id: a.id, label: a.label, scale: a.scale ?? 1, meta, job: f && !f.reply ? jobText(f.folder) : null };
+        return {
+          id: a.id,
+          label: a.label,
+          scale: a.scale ?? 1,
+          brief: a.brief ?? "",
+          variants: a.variants ?? 1,
+          grid: gridOf(a.variants),
+          size: sheetSize(a),
+          overlay: a.overlay ?? null,
+          meta,
+          job: f && !f.reply ? jobText(f.folder) : null,
+        };
       }),
     })),
   });
@@ -192,6 +208,24 @@ function api(cfg: LoadedConfig, L: Logger): Plugin {
               L.scope(b.asset).info(`${basename(dir)}: Send received (${b.pins.length} pin(s), mask ${b.mask ? "yes" : "no"}, ${b.photos.length} photo(s))`);
               if (cfg.agent === "codex") queue.push(dir, b.asset);
               return { ok: true, folder: basename(dir), agent: cfg.agent };
+            });
+          if (req.method === "POST" && url.pathname === "/generate")
+            return body((b: { assets: string[]; note?: string }) => {
+              const ids = [...new Set(Array.isArray(b.assets) ? b.assets : [])];
+              if (!ids.length) throw new StoreError("no assets selected");
+              if (ids.length > MAX_GENERATE) throw new StoreError(`at most ${MAX_GENERATE} images per Generate (each takes a few minutes): select fewer`);
+              const results = ids.map((id) => {
+                try {
+                  const dir = writeGenerateRequest(cfg, id, String(b.note ?? ""));
+                  L.scope(id).info(`${basename(dir)}: Generate requested${b.note ? " (with a note)" : ""}`);
+                  if (cfg.agent === "codex") queue.push(dir, id);
+                  return { id, ok: true, detail: basename(dir) };
+                } catch (e) {
+                  if (!(e instanceof StoreError)) throw e;
+                  return { id, ok: false, detail: e.message };
+                }
+              });
+              return { results, agent: cfg.agent };
             });
           if (req.method === "POST" && url.pathname === "/accept")
             return body((b) => {

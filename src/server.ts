@@ -6,17 +6,28 @@ import { fileURLToPath } from "node:url";
 import { createServer, type Plugin } from "vite";
 import type { LoadedConfig } from "./config.ts";
 import { fixFeedback } from "./fixer.ts";
+import { createLogger, tailLog, type Logger } from "./log.ts";
+import { allTags, createTag, deleteTag, editTagAssets, renameTag } from "./tags.ts";
 import {
+  allJobs,
+  applyBatch,
   getMeta,
+  isInterrupted,
+  jobLabel,
   latestFeedback,
   makeCurrent,
   pendingFeedback,
+  readDrafts,
+  readJob,
   rejectCandidate,
   setStatus,
   StoreError,
   versionPath,
+  writeDraft,
   writeFeedback,
+  writeJob,
   writeReply,
+  type BatchAction,
   type ReviewStatus,
   type SendPayload,
 } from "./store.ts";
@@ -25,36 +36,66 @@ const CLIENT = join(dirname(fileURLToPath(import.meta.url)), "client");
 const MAX_BODY = 60 * 1024 * 1024;
 const STATUSES: ReviewStatus[] = ["generated", "in_review", "needs_fix", "approved"];
 
-/** Codex mode: Sends are fixed one at a time, in order. */
-class FixQueue {
+/**
+ * Codex mode: Sends are fixed one at a time, in order. A job that hangs is killed by the fixer's timeout
+ * (`fixTimeoutMin`), so one bad Codex run can no longer block every Send behind it.
+ */
+export class FixQueue {
   private chain: Promise<void> = Promise.resolve();
-  readonly running = new Map<string, string>();
-  constructor(private cfg: LoadedConfig) {}
+  private waiting: string[] = [];
+  current: string | null = null;
+  constructor(
+    private cfg: LoadedConfig,
+    private L: Logger,
+  ) {}
+  /** 1-based place among the waiting jobs (0 = running now, -1 = not in this queue). */
+  position(folder: string): number {
+    if (this.current === folder) return 0;
+    const i = this.waiting.indexOf(folder);
+    return i < 0 ? -1 : i + 1;
+  }
   push(folder: string, asset: string): void {
-    this.running.set(asset, "queued");
+    if (this.position(folder) >= 0) return;
+    this.waiting.push(folder);
+    writeJob(folder, { state: "queued", stage: "", agent: "codex", owner: process.pid, queuedAt: new Date().toISOString() });
+    this.L.scope(asset).info(`${basename(folder)}: queued (${this.waiting.length} waiting${this.current ? `, running ${basename(this.current)}` : ""})`);
     this.chain = this.chain.then(async () => {
-      this.running.set(asset, "codex is editing…");
+      this.waiting.shift();
+      this.current = folder;
       try {
-        await fixFeedback(this.cfg, folder, { agent: "codex", log: (s) => console.log(`[${asset}] ${s}`) });
+        await fixFeedback(this.cfg, folder, { agent: "codex", logger: this.L });
       } catch (e) {
+        // fixFeedback already logged it and marked job.json failed; answer the Send so the page stops waiting.
         const msg = e instanceof Error ? e.message : String(e);
-        console.error(`[${asset}] fix failed: ${msg}`);
         writeReply(folder, { summary: `Fix failed: ${msg.slice(0, 300)}`, notes: [{ pin: null, status: "wont", text: msg.slice(0, 300) }] });
       } finally {
-        this.running.delete(asset);
+        this.current = null;
       }
     });
   }
 }
 
-function api(cfg: LoadedConfig): Plugin {
-  const queue = new FixQueue(cfg);
-  if (cfg.agent === "codex") for (const f of pendingFeedback(cfg)) queue.push(f, JSON.parse(readFileSync(join(f, "notes.json"), "utf8")).asset);
+function api(cfg: LoadedConfig, L: Logger): Plugin {
+  const queue = new FixQueue(cfg, L);
+  for (const f of pendingFeedback(cfg)) {
+    const asset = JSON.parse(readFileSync(join(f, "notes.json"), "utf8")).asset as string;
+    const j = readJob(f);
+    if (j && isInterrupted(j)) L.scope(asset).warn(`${basename(f)}: was "${j.state}: ${j.stage}" when its studio process stopped`);
+    if (cfg.agent === "codex") queue.push(f, asset);
+  }
+
+  /** Page text for an unanswered Send: stage, elapsed time and place in the queue. */
+  const jobText = (folder: string): string | null => {
+    const pos = queue.position(folder);
+    const label = jobLabel(readJob(folder));
+    return pos > 0 && label ? `${label} · #${pos} in queue` : label;
+  };
 
   const project = () => ({
     name: cfg.name,
     agent: cfg.agent,
     stage: cfg.stage ?? {},
+    tags: allTags(cfg),
     groups: cfg.groups.map((g) => ({
       id: g.id,
       label: g.label,
@@ -65,7 +106,8 @@ function api(cfg: LoadedConfig): Plugin {
         } catch (e) {
           if (!(e instanceof StoreError)) throw e;
         }
-        return { id: a.id, label: a.label, scale: a.scale ?? 1, meta, job: queue.running.get(a.id) ?? null };
+        const f = latestFeedback(cfg, a.id);
+        return { id: a.id, label: a.label, scale: a.scale ?? 1, meta, job: f && !f.reply ? jobText(f.folder) : null };
       }),
     })),
   });
@@ -86,6 +128,12 @@ function api(cfg: LoadedConfig): Plugin {
         const asset = url.searchParams.get("asset") ?? "";
         const known = cfg.byId.has(asset);
 
+        const fail = (e: unknown) => {
+          const msg = e instanceof Error ? e.message : "error";
+          if (e instanceof StoreError) L.warn(`${req.method} ${url.pathname}: ${msg}`);
+          else L.error(`${req.method} ${url.pathname} crashed: ${e instanceof Error ? (e.stack ?? msg) : msg}`);
+          json(e instanceof StoreError ? 400 : 500, { error: msg });
+        };
         const body = (fn: (b: any) => unknown) => {
           const chunks: Buffer[] = [];
           let size = 0;
@@ -98,7 +146,7 @@ function api(cfg: LoadedConfig): Plugin {
             try {
               json(200, fn(JSON.parse(Buffer.concat(chunks).toString("utf8") || "{}")) ?? { ok: true });
             } catch (e) {
-              json(e instanceof StoreError ? 400 : 500, { error: e instanceof Error ? e.message : "error" });
+              fail(e);
             }
           });
         };
@@ -123,11 +171,25 @@ function api(cfg: LoadedConfig): Plugin {
           if (req.method === "GET" && url.pathname === "/feedback") {
             if (!known) return json(404, { error: "unknown asset" });
             const f = latestFeedback(cfg, asset);
-            return json(200, f && { folder: basename(f.folder), ack: f.ack, reply: f.reply, job: queue.running.get(asset) ?? null });
+            return json(200, f && { folder: basename(f.folder), ack: f.ack, reply: f.reply, job: f.reply ? null : jobText(f.folder) });
           }
+          if (req.method === "GET" && url.pathname === "/log") {
+            const n = Math.min(5000, Math.max(1, Number(url.searchParams.get("n") ?? 300) || 300));
+            res.setHeader("content-type", "text/plain; charset=utf-8");
+            res.setHeader("cache-control", "no-store");
+            return res.end(tailLog(cfg.dataDir, n) || "(no log yet)");
+          }
+          if (req.method === "GET" && url.pathname === "/jobs")
+            return json(
+              200,
+              allJobs(cfg)
+                .slice(0, 50)
+                .map((j) => ({ folder: basename(j.folder), asset: j.asset, answered: j.answered, job: j.job, label: jobLabel(j.job), queue: queue.position(j.folder) })),
+            );
           if (req.method === "POST" && url.pathname === "/send")
             return body((b: SendPayload) => {
               const dir = writeFeedback(cfg, b);
+              L.scope(b.asset).info(`${basename(dir)}: Send received (${b.pins.length} pin(s), mask ${b.mask ? "yes" : "no"}, ${b.photos.length} photo(s))`);
               if (cfg.agent === "codex") queue.push(dir, b.asset);
               return { ok: true, folder: basename(dir), agent: cfg.agent };
             });
@@ -136,10 +198,55 @@ function api(cfg: LoadedConfig): Plugin {
               const id = need(b);
               const meta = getMeta(cfg, id);
               if (meta.candidate == null) throw new StoreError("no candidate to accept");
+              L.scope(id).info(`accepted v${meta.candidate} (was v${meta.current})`);
               return makeCurrent(cfg, id, meta.candidate);
             });
-          if (req.method === "POST" && url.pathname === "/reject") return body((b) => rejectCandidate(cfg, need(b)));
-          if (req.method === "POST" && url.pathname === "/revert") return body((b) => makeCurrent(cfg, need(b), Number(b.v)));
+          if (req.method === "POST" && url.pathname === "/reject")
+            return body((b) => {
+              const id = need(b);
+              L.scope(id).info(`rejected candidate v${getMeta(cfg, id).candidate}`);
+              return rejectCandidate(cfg, id);
+            });
+          if (req.method === "POST" && url.pathname === "/revert")
+            return body((b) => {
+              const id = need(b);
+              L.scope(id).info(`reverted to v${Number(b.v)}`);
+              return makeCurrent(cfg, id, Number(b.v));
+            });
+          if (req.method === "POST" && url.pathname === "/batch")
+            return body((b: { action: BatchAction; assets: string[] }) => {
+              const results = applyBatch(cfg, b.action, b.assets);
+              const ok = results.filter((r) => r.ok).length;
+              L.info(`batch ${b.action}: ${ok}/${results.length} ok${results.some((r) => !r.ok) ? ` (skipped: ${results.filter((r) => !r.ok).map((r) => `${r.id} ${r.detail}`).join(", ")})` : ""}`);
+              return { results };
+            });
+          if (req.method === "POST" && url.pathname === "/tag")
+            return body((b: { op: string; id?: string; label?: string; assets?: string[]; add?: string[]; remove?: string[] }) => {
+              const id = String(b.id ?? "");
+              if (b.op === "create") {
+                const t = createTag(cfg, b.label, b.assets ?? []);
+                L.info(`tag created: "${t.label}" (${t.id}) with ${t.assets.length} asset(s)`);
+                return t;
+              }
+              if (b.op === "rename") {
+                renameTag(cfg, id, b.label);
+                L.info(`tag ${id} renamed to "${String(b.label).trim()}"`);
+                return { ok: true };
+              }
+              if (b.op === "delete") {
+                deleteTag(cfg, id);
+                L.info(`tag ${id} deleted`);
+                return { ok: true };
+              }
+              if (b.op === "assets") {
+                const n = editTagAssets(cfg, id, b.add ?? [], b.remove ?? []);
+                L.info(`tag ${id}: +${b.add?.length ?? 0} -${b.remove?.length ?? 0} asset(s), now ${n}`);
+                return { ok: true, count: n };
+              }
+              throw new StoreError("bad tag op");
+            });
+          if (req.method === "GET" && url.pathname === "/drafts") return json(200, readDrafts(cfg));
+          if (req.method === "POST" && url.pathname === "/draft") return body((b) => writeDraft(cfg, need(b), b.draft ?? null));
           if (req.method === "POST" && url.pathname === "/status")
             return body((b) => {
               if (!STATUSES.includes(b.status)) throw new StoreError("bad status");
@@ -147,7 +254,7 @@ function api(cfg: LoadedConfig): Plugin {
             });
           json(404, { error: "not found" });
         } catch (e) {
-          json(e instanceof StoreError ? 400 : 500, { error: e instanceof Error ? e.message : "error" });
+          fail(e);
         }
       });
     },
@@ -156,13 +263,16 @@ function api(cfg: LoadedConfig): Plugin {
 
 export async function startServer(cfg: LoadedConfig): Promise<void> {
   const port = cfg.port ?? 5180;
+  const L = createLogger(cfg.dataDir, { source: "dev" });
+  process.on("uncaughtException", (e) => L.error(`uncaught: ${e.stack ?? e.message}`));
+  process.on("unhandledRejection", (e) => L.error(`unhandled rejection: ${e instanceof Error ? (e.stack ?? e.message) : String(e)}`));
   const server = await createServer({
     root: CLIENT,
     configFile: false,
     logLevel: "warn",
     server: { port, strictPort: true, host: "127.0.0.1" },
-    plugins: [api(cfg)],
+    plugins: [api(cfg, L)],
   });
   await server.listen();
-  console.log(`Asset Studio for "${cfg.name}" on http://127.0.0.1:${port}  (agent: ${cfg.agent})`);
+  L.info(`Asset Studio for "${cfg.name}" on http://127.0.0.1:${port}  (agent: ${cfg.agent}, fix timeout ${cfg.fixTimeoutMin ?? 10} min, log: ${L.file})`);
 }

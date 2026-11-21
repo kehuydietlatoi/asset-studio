@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { loadConfig } from "../src/config.ts";
 import { blank, composite, flatten, keyOut, maskFrom, readPng, resize, softenMask, writePng } from "../src/png.ts";
-import { addCandidate, getMeta, makeCurrent, pendingFeedback, StoreError, writeFeedback } from "../src/store.ts";
+import { addCandidate, applyBatch, getMeta, makeCurrent, pendingFeedback, readDrafts, StoreError, writeDraft, writeFeedback } from "../src/store.ts";
 import { buildInstruction, fixFeedback } from "../src/fixer.ts";
 
 const solid = (w: number, h: number, rgba: number[]) => {
@@ -89,5 +89,35 @@ describe("store", () => {
     expect(r.prompt).toContain("THE ONLY CHANGE:");
     expect(r.prompt).toContain("1. make it blue");
     expect(buildInstruction({ asset: "unit/a", version: 1, imageSize: [8, 8], pins: [], notes: "x", hasMask: false }, "b")).toContain("Asset: b");
+  });
+});
+
+describe("board batch + drafts", () => {
+  it("applies one action to many assets, skipping what does not apply", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "as-b-"));
+    for (const n of ["a", "b"]) writePng(join(dir, `${n}.png`), solid(4, 4, [9, 9, 9, 255]));
+    writeFileSync(
+      join(dir, "asset-studio.config.mjs"),
+      `export default { name: "t", agent: "claude", groups: [{ id: "g", label: "G", assets: [{ id: "u/a", label: "A", file: "a.png" }, { id: "u/b", label: "B", file: "b.png" }] }] };`,
+    );
+    const cfg = await loadConfig(join(dir, "asset-studio.config.mjs"));
+    writePng(join(dir, "new.png"), solid(4, 4, [0, 200, 0, 255]));
+    addCandidate(cfg, "u/a", join(dir, "new.png"), { source: "fix", parent: 1 });
+
+    const acc = applyBatch(cfg, "accept", ["u/a", "u/b", "u/a"]);
+    expect(acc).toEqual([
+      { id: "u/a", ok: true, detail: "v2 accepted" },
+      { id: "u/b", ok: false, detail: "no candidate" },
+    ]);
+    expect(readPng(join(dir, "a.png")).data[1]).toBe(200);
+    expect(applyBatch(cfg, "approve", ["u/a", "u/b", "nope"]).map((r) => r.ok)).toEqual([true, true, false]);
+    expect(getMeta(cfg, "u/b").status).toBe("approved");
+    expect(() => applyBatch(cfg, "delete" as never, ["u/a"])).toThrow(StoreError);
+
+    writeDraft(cfg, "u/b", { items: [{ kind: "pin", x: 1, y: 1, text: "fix" }], notes: "", photos: [] });
+    expect(readDrafts(cfg)).toEqual({ "u/b": { items: [{ kind: "pin", x: 1, y: 1, text: "fix" }], notes: "", photos: [] } });
+    writeDraft(cfg, "u/b", null);
+    expect(readDrafts(cfg)).toEqual({});
+    expect(() => writeDraft(cfg, "../x", {})).toThrow(StoreError);
   });
 });

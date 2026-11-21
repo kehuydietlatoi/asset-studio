@@ -47,6 +47,7 @@ games use it as: npx asset-studio dev --config ./asset-studio.config.ts
 | M2 | `codex-image` fixer with mask + composite, version history, `lineup` stage | The HOV audit items (11, 12, 13, 09 …) are fixed through the studio, no manual prompts |
 | M3 | Review board + status chips; HOV 2★/3★ forms reviewed in it | A whole unit group can be audited and sent in one pass |
 | M4 | `openai-edit` fixer, `sheet` stage for animation frames | Animation frames can be marked up frame by frame |
+| M5 | Tags + saved rules + mass regenerate (section 6) | A rule saved on a tag is applied to up to 10 selected images with a pilot, auto-masks and a review grid |
 
 ## 5. Owner decisions (2026-11-20)
 
@@ -56,10 +57,98 @@ games use it as: npx asset-studio dev --config ./asset-studio.config.ts
   over) is now optional.
 - Local only.
 
-Status: M2 core built and tested end to end on HOV unit AD_U_11 (masked crest swap). Board view and status chips
-exist in a first form; batch "send all marked" is still to do (M3).
+Status: M2 core built and tested end to end on HOV unit AD_U_11 (masked crest swap).
 
-## 6. Original open questions (answered above)
+M3 (2026-11-21): board filters with counts, multi-select (Shift range), batch Approve / Needs fix / Accept / Reject,
+"Send all marked", "Send note to selected", server-side drafts. Also a fix timeout and studio log
+(`fixTimeoutMin`, `.asset-studio/logs/studio.log`). Still open in M3: the real HOV 2★/3★ audit run through the board.
+
+## 6. M5: tags and saved rules (user feedback, 2026-11-21)
+
+### The request (HOV user, translated)
+
+1. Group images into folders for easier management: map objects, backgrounds, by hero, by unit type, etc.
+2. Mass edit by a new rule: change the texture everywhere, add one detail to every image, or change the colour rule
+   for every image. Ideally: select the images, apply the new rule, regenerate them all.
+
+### Why M3 does not cover it
+
+- M3 **groups** come from `asset-studio.config.mjs` (only the dev edits them) and each asset is in exactly one group.
+  The request needs user-managed, overlapping sets: unit 01 is "Âu Lạc" and "Tank" and "1★" at once.
+- M3 **"Send note to selected"** is a one-off instruction, not saved, with no consistency across images and no
+  "which images are behind the current rules" view.
+
+### Owner decisions (grilling session, 2026-11-21)
+
+| Topic | Decision |
+| --- | --- |
+| Folder model | **Tags**: one image in any number of tags. Stored as id lists; images are never copied (no storage cost; the storage cost is versions, ~1 MB per regenerated image) |
+| Who edits tags | **Both**: config defines starting tags (existing groups become tags, plus `tags` with id patterns); users create, rename and fill tags in the page |
+| Rule lifetime | **Saved rules**, kept with a revision history |
+| Rule scope | A rule belongs to **one tag** and applies to every image in it, including images added later |
+| What a rule may change | **Auto-mask by words**: the rule names a region ("the shield", "the helmet") and the agent finds it in each image; or the region is **"whole image"** (texture, palette), with a drift warning |
+| Existing art when a rule is added or edited | **Marked outdated** (chip + Board filter); nothing regenerates by itself. Editing a rule's text makes its images outdated again |
+| Consistency | **Pilot first**: the user picks **1-3 pilots** in the batch; they run alone; once accepted, their results are style references for the rest |
+| Auto-mask checking | **Only flagged masks stop for review**; the rest run straight through |
+| Rule clashes (image in two tags with contradicting rules) | **All rules go into the prompt; the agent merges them** |
+| Cost limit | **Hard cap: 10 images per batch** |
+| Review | **Review grid**: before/after on each card, tick, Accept selected / Reject selected |
+
+Two safeguards added on top of those choices:
+
+- "Flagged" masks are decided by **checks, not by the model's self-reported confidence** (not reliable): mask
+  empty, mask over 60% of the image, or area more than 3x off the batch median. Flagged images pause; the user fixes
+  the mask in Focus (pre-filled) and resumes.
+- Because clashes are merged silently, **every version records which rules (id + revision) went into it**, so an
+  unexpected result can be traced to its rules.
+
+### Data (all in `.asset-studio/`, game files untouched until Accept)
+
+- `tags.json`: user tags `{ id, label, assets: [ids] }`. Config tags are read-only in the page: every config
+  `group` is a tag, and the config may add `tags: [{ id, label, match: "unit/*/s2" }]` (patterns, so new assets join
+  by themselves).
+- `rules.json`: `{ id, tag, text, region: "whole" | "<words>", rev, history: [{ rev, text, region, at }] }`.
+- Version entries in `meta.json` gain `rules: [{ id, rev }]` and `refs` (pilot versions used).
+- **Outdated** is computed, not stored: an image is outdated for rule R if it is in R's tag and its current version
+  does not list R at R's current revision.
+
+### Flow
+
+1. **Tag and rule.** On the Board, select images, add them to a tag. In the tag's panel, write a rule: text + region.
+   Every image in the tag shows `outdated: <rule>`.
+2. **Apply.** Filter "Outdated", select up to 10, press **Apply rules**. The dialog lists the rules per image, the
+   estimate (~2 min per image, plus auto-mask) and asks for 1-3 pilots. More than 10: refused, split it.
+3. **Pilots.** Auto-mask + edit for the pilots only. The batch pauses at "Pilots ready". Accept: their results become
+   style references. Reject: edit the rule or retry.
+4. **Auto-mask the rest.** One Codex call for the whole batch: the images are attached, the reply is a JSON outline
+   of the region per image, which becomes a mask (grown and feathered as today). "Whole image" rules skip this.
+   Flagged masks pause their image.
+5. **Generate.** The existing fixer, with the merged rules as the instruction, style refs + pilot results as
+   references, and the version tagged with the rules it used. Runs on the server's queue in both agent modes (it is
+   mechanical), with the M3 timeout, log and `job.json`.
+6. **Review grid.** "Has candidate" filter, before/after per card, Accept selected / Reject selected. Accepted images
+   stop being outdated; rejected ones stay outdated.
+
+### Build order
+
+| Step | Scope | Done when |
+| --- | --- | --- |
+| M5a Tags | `tags.json`, config `tags` with patterns, groups become tags; Board tag picker (replaces the group picker), New tag / Add to tag / Remove from tag on the selection; list sidebar by tag | Unit 01 shows under "Âu Lạc", "Tank" and "1★"; tags survive restart; tests |
+| M5b Rules + outdated | Rules CRUD per tag with revisions; outdated chip + Board filter; rules recorded in versions; no generation yet | Saving a rule on "Tank" marks exactly the tank images outdated; editing it re-marks them |
+| M5c Auto-mask spike | CLI `asset-studio automask <id...> --region "<words>"`: writes masks + overlays; run on the 13 1★ units for "the shield" and "the helmet" | Go if at least 10 of 13 masks are usable per region. No-go fallback: region rules need a painted mask, "whole image" rules still work |
+| M5d Apply rules | Dialog, cap 10, pilots, pause/resume, auto-mask + checks, generation with refs, progress on cards | A rule on "1★" applied to 10 units end to end with 1 pilot |
+| M5e Review grid | Before/after on cards (hover or slider), batch summary | 10 candidates reviewed and accepted/rejected in one screen |
+
+### Risks
+
+- **Auto-mask accuracy** is the big unknown (vision models are rough at outlines). M5c is a go/no-go spike before
+  M5d is built on it.
+- **Whole-image rules drift** (pose, face, proportions change). Pilots and the review grid catch it; nothing is written
+  to the game until Accept.
+- **Quota and time:** 10 images ≈ 20-25 min plus one auto-mask call. The cap keeps a mistaken select-all cheap.
+- **Merged rules** can produce results nobody asked for; the per-version rule record is the way to debug it.
+
+## 7. Original open questions (answered above)
 
 1. **Repo:** a new git repo at `gamedev/asset-studio` (this folder), used by games as a dev dependency? Or a
    folder copied into each game?

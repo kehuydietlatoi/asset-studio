@@ -5,9 +5,10 @@
  *                                      status.json (written last = complete), ack.json, reply.json
  * <dir> is the asset id with "/" replaced by "__".
  */
-import { copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
+import { copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { LoadedConfig } from "./config.ts";
+import { fmtDuration } from "./log.ts";
 import { readPng } from "./png.ts";
 
 export type ReviewStatus = "generated" | "in_review" | "needs_fix" | "approved";
@@ -211,6 +212,154 @@ export function writeAck(dir: string, by: string): void {
 
 export function writeReply(dir: string, reply: Reply): void {
   writeJson(join(dir, "reply.json"), reply);
+}
+
+// ---------------------------------------------------------------- board: batch actions + drafts
+
+export type BatchAction = "approve" | "needs_fix" | "accept" | "reject";
+export interface BatchResult {
+  id: string;
+  ok: boolean;
+  detail: string;
+}
+
+/** One action on many assets; one asset failing does not stop the others. */
+export function applyBatch(cfg: LoadedConfig, action: BatchAction, ids: string[]): BatchResult[] {
+  if (!["approve", "needs_fix", "accept", "reject"].includes(action)) throw new StoreError("bad batch action");
+  if (!Array.isArray(ids) || !ids.length) throw new StoreError("no assets selected");
+  return [...new Set(ids)].map((id) => {
+    try {
+      if (!cfg.byId.has(id)) throw new StoreError("unknown asset");
+      const meta = getMeta(cfg, id);
+      if (action === "approve" || action === "needs_fix") {
+        setStatus(cfg, id, action === "approve" ? "approved" : "needs_fix");
+        return { id, ok: true, detail: action === "approve" ? "approved" : "needs fix" };
+      }
+      if (meta.candidate == null) return { id, ok: false, detail: "no candidate" };
+      const n = meta.candidate;
+      if (action === "accept") {
+        makeCurrent(cfg, id, n);
+        return { id, ok: true, detail: `v${n} accepted` };
+      }
+      rejectCandidate(cfg, id);
+      return { id, ok: true, detail: `v${n} rejected` };
+    } catch (e) {
+      if (!(e instanceof StoreError)) throw e;
+      return { id, ok: false, detail: e.message };
+    }
+  });
+}
+
+/**
+ * Unsent mark-up per asset (`drafts/<dir>.json`), so a long audit survives a page reload. The page owns the
+ * shape; the store only checks it is a JSON object of sane size.
+ */
+const MAX_DRAFT = 40 * 1024 * 1024;
+
+function draftPath(cfg: LoadedConfig, id: string): string {
+  return join(cfg.dataDir, "drafts", `${dirOf(id)}.json`);
+}
+
+export function writeDraft(cfg: LoadedConfig, id: string, draft: unknown): void {
+  if (!cfg.byId.has(id)) throw new StoreError("unknown asset");
+  const p = draftPath(cfg, id);
+  if (draft == null) {
+    if (existsSync(p)) rmSync(p);
+    return;
+  }
+  if (typeof draft !== "object" || Array.isArray(draft)) throw new StoreError("draft must be an object");
+  const text = JSON.stringify(draft);
+  if (text.length > MAX_DRAFT) throw new StoreError("draft larger than 40 MB");
+  mkdirSync(join(cfg.dataDir, "drafts"), { recursive: true });
+  writeFileSync(p, text);
+}
+
+export function readDrafts(cfg: LoadedConfig): Record<string, unknown> {
+  const out: Record<string, unknown> = {};
+  for (const id of cfg.byId.keys()) {
+    try {
+      const d = readJson<unknown>(draftPath(cfg, id));
+      if (d) out[id] = d;
+    } catch {
+      /* a corrupt draft is dropped, not fatal */
+    }
+  }
+  return out;
+}
+
+// ---------------------------------------------------------------- jobs
+
+/**
+ * `job.json` in a Send folder: where the fix for that Send is right now. Written by the queue (queued) and by
+ * the fixer at every stage, so a stuck job shows exactly which step it is stuck in, and since when.
+ */
+export type JobState = "queued" | "running" | "done" | "failed";
+
+export interface Job {
+  state: JobState;
+  stage: string;
+  agent: string;
+  /** pid of the studio process that owns the job (the dev server or a `fix` run). */
+  owner: number;
+  /** pid of the running codex process, if any. */
+  pid?: number;
+  attempt?: number;
+  queuedAt?: string;
+  startedAt?: string;
+  updatedAt: string;
+  endedAt?: string;
+  error?: string;
+  candidate?: number;
+}
+
+export function readJob(dir: string): Job | null {
+  try {
+    return readJson<Job>(join(dir, "job.json"));
+  } catch {
+    return null; // half-written by another process: next poll reads it
+  }
+}
+
+/** Merge `patch` into the folder's job.json and stamp `updatedAt`. */
+export function writeJob(dir: string, patch: Partial<Job>): Job {
+  const job = { ...(readJob(dir) ?? { state: "queued", stage: "", agent: "", owner: process.pid }), ...patch, updatedAt: now() } as Job;
+  if (patch.state === "queued" || patch.state === "running") delete job.error;
+  writeJson(join(dir, "job.json"), job);
+  return job;
+}
+
+export function processAlive(pid: number | undefined): boolean {
+  if (!pid) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (e) {
+    return (e as NodeJS.ErrnoException).code === "EPERM";
+  }
+}
+
+/** A queued/running job whose owner process is gone will never finish. */
+export function isInterrupted(j: Job): boolean {
+  return (j.state === "queued" || j.state === "running") && !processAlive(j.owner);
+}
+
+/** One line for the page: what the job is doing and for how long. null when there is nothing to show. */
+export function jobLabel(j: Job | null, at = Date.now()): string | null {
+  if (!j) return null;
+  const since = (iso?: string) => (iso ? fmtDuration(at - Date.parse(iso)) : "?");
+  if (isInterrupted(j)) return `Interrupted while "${j.stage}" (the studio process stopped). Send again.`;
+  if (j.state === "queued") return `Queued for ${since(j.queuedAt)}${j.stage ? ` · ${j.stage}` : ""}`;
+  if (j.state === "running") return `${j.agent}: ${j.stage} · ${since(j.startedAt)}`;
+  if (j.state === "failed") return `Fix failed: ${(j.error ?? j.stage).replace(/\s+/g, " ").trim()}`;
+  return null;
+}
+
+/** Every Send folder of the project with its job, newest first. */
+export function allJobs(cfg: LoadedConfig): { folder: string; asset: string; job: Job | null; answered: boolean }[] {
+  const out: { folder: string; asset: string; job: Job | null; answered: boolean }[] = [];
+  for (const id of cfg.byId.keys())
+    for (const dir of foldersOf(cfg, id)) out.push({ folder: dir, asset: id, job: readJob(dir), answered: existsSync(join(dir, "reply.json")) });
+  return out.sort((a, b) => b.folder.slice(-15).localeCompare(a.folder.slice(-15)));
 }
 
 export function readNotes(dir: string): Notes {

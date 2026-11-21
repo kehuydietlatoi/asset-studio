@@ -28,6 +28,9 @@ game repo root (the folder with `asset-studio.config.mjs`).
    (`.asset-studio/assets/<id with / as __>/v<n>.png`). If the edit ignored the instruction or broke the style, run
    `fix` again with a sharper instruction (it makes a new candidate). If parts of the old object survive at the mask
    edge, reply asking the owner to paint the mask wider.
+   If `fix` fails or times out (`fixTimeoutMin`, default 10 min), read the error, then `asset-studio log -n 40` and
+   `<folder>/work/codex.log`. Retry once if it looks transient; otherwise write `reply.json` with `"status": "wont"`
+   and the reason, so the page stops showing the job as running.
 7. **Reply in one terminal line** too: what changed, which version to compare.
 8. Accepting writes the game file (`file` in the config). Commit game assets only when the owner asks.
 

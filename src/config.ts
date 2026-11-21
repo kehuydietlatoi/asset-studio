@@ -40,6 +40,8 @@ export interface StudioConfig {
   stage?: { sky?: string; ground?: string; groundY?: number };
   groups: GroupDef[];
   port?: number;
+  /** Kill a Codex image edit that runs longer than this (minutes) and fail the job, so the queue moves on. Default 10. */
+  fixTimeoutMin?: number;
 }
 
 export interface LoadedConfig extends StudioConfig {

@@ -47,13 +47,31 @@ asset-studio pending                  list unanswered Sends
 asset-studio accept|reject <id>       accept or reject the current candidate (same as the page buttons)
 asset-studio request <id> --note <t> [--rect x0,y0,x1,y1]... [--ellipse ...]   file a Send from the CLI (agent batch fixes)
 asset-studio fix <folder> [--instruction <text>|--instruction-file <f>] [--agent claude|codex] [--dry-run]
+asset-studio jobs [--all]             each Send's fix state: queued / running (stage + time, codex pid) / failed / interrupted
+asset-studio log [-n <lines>]         tail of the studio log
 ```
+
+## When a fix looks stuck
+
+Every fix has a time limit: `fixTimeoutMin` in the config, default 10 minutes. After that the Codex process tree is
+killed, the Send is marked failed and the queue moves on. The page shows the current stage and elapsed time
+("codex: codex image edit (attempt 1) · 2m 10s"). For more detail:
+
+1. `asset-studio jobs`, or the page's **Log** link (`/api/log`), shows which Send is stuck, in which stage and for how long.
+2. `.asset-studio/logs/studio.log` is one log shared by the server, watcher and `fix` runs: every Send, stage, Codex
+   start/exit/heartbeat (every 30 s), timeout, accept/reject and server error. It rotates at 5 MB.
+3. `feedback/<id>/<stamp>/work/codex.log` holds Codex's full output for that Send, for each attempt.
+4. `feedback/<id>/<stamp>/job.json` holds the job's live state. If the process that owned the job is gone, the page
+   says "Interrupted"; send the asset again.
+
+When someone reports a stuck job, ask them for `studio.log` and that Send's folder.
 
 ## Data (in the game repo, `.asset-studio/`)
 
 - `assets/<id>/v<n>.png` + `meta.json`: versions, current, candidate, review status.
 - `feedback/<id>/<stamp>/`: `notes.json`, `sketch.png`, `mask.png`, `photos/`, `before.png`, `status.json`,
-  `ack.json`, `reply.json`, `work/` (prompts, raw edit, composited result).
+  `ack.json`, `job.json` (fix state), `reply.json`, `work/` (prompts, `codex.log`, raw edit, composited result).
+- `logs/studio.log`: the studio log (see above).
 
 ## Limits
 

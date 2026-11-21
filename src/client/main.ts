@@ -85,7 +85,12 @@ function toast(s: string) {
 // ------------------------------------------------------------------ list + board
 
 function chip(a: AssetRow): string {
-  if (a.job) return `<span class="chip job">${a.job}</span>`;
+  if (a.job) {
+    // Full text (stage, elapsed, queue place) on hover; the list only has room for the gist.
+    const esc = (s: string) => s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/"/g, "&quot;");
+    const short = a.job.startsWith("Fix failed") ? "fix failed" : a.job.startsWith("Interrupted") ? "interrupted" : a.job.startsWith("Queued") ? "queued" : "fixing…";
+    return `<span class="chip job" title="${esc(a.job)}">${short}</span>`;
+  }
   const s = a.meta?.status ?? "generated";
   const cand = a.meta?.candidate ? ` · v${a.meta.candidate} ready` : "";
   return `<span class="chip ${s}">${STATUS_LABEL[s] ?? s}${cand}</span>`;

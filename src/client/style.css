@@ -17,6 +17,8 @@ body { margin: 0; height: 100vh; display: flex; flex-direction: column; }
 header { display: flex; align-items: center; gap: 12px; padding: 8px 14px; border-bottom: 1px solid var(--line); background: var(--panel); }
 #views { display: flex; gap: 4px; margin-left: 16px; }
 #toast { margin-left: auto; color: var(--accent); }
+#logLink { color: var(--dim); font-size: 12px; text-decoration: none; border: 1px solid var(--line); border-radius: 10px; padding: 2px 8px; }
+#logLink:hover { color: var(--text); }
 .badge { font-size: 12px; padding: 2px 8px; border-radius: 10px; background: var(--line); color: var(--dim); }
 main { flex: 1; display: grid; grid-template-columns: 240px 1fr 340px; min-height: 0; }
 aside { overflow: auto; background: var(--panel); padding: 10px; }
